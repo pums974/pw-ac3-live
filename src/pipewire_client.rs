@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use log::info;
 use pipewire as pw;
 use pipewire::main_loop::MainLoop;
@@ -67,42 +67,50 @@ fn build_playback_properties(target: &PlaybackTarget) -> pw::properties::Propert
     playback_props
 }
 
-fn parse_f32_plane(raw_data: &[u8], offset: usize, size: usize) -> Option<Vec<f32>> {
+fn parse_f32_plane_into(
+    raw_data: &[u8],
+    offset: usize,
+    size: usize,
+    out: &mut Vec<f32>,
+) -> Option<()> {
     let end = offset.checked_add(size)?;
     let bytes = raw_data.get(offset..end)?;
     if !offset.is_multiple_of(size_of::<f32>()) || !bytes.len().is_multiple_of(size_of::<f32>()) {
         return None;
     }
 
-    let mut samples = Vec::with_capacity(bytes.len() / size_of::<f32>());
+    out.clear();
+    out.reserve(bytes.len() / size_of::<f32>());
     for chunk in bytes.chunks_exact(size_of::<f32>()) {
-        samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    Some(samples)
+    Some(())
 }
 
-fn parse_f32_interleaved(
+fn parse_f32_interleaved_into(
     raw_data: &[u8],
     offset: usize,
     size: usize,
     channels: usize,
-) -> Option<Vec<f32>> {
+    out: &mut Vec<f32>,
+) -> Option<()> {
     if channels == 0 {
         return None;
     }
 
-    let mut samples = parse_f32_plane(raw_data, offset, size)?;
-    let valid_len = samples.len() - (samples.len() % channels);
-    samples.truncate(valid_len);
-    Some(samples)
+    parse_f32_plane_into(raw_data, offset, size, out)?;
+    let valid_len = out.len() - (out.len() % channels);
+    out.truncate(valid_len);
+    Some(())
 }
 
-fn parse_interleaved_from_stride(
+fn parse_interleaved_from_stride_into(
     raw_data: &[u8],
     offset: usize,
     size: usize,
     stride: usize,
-) -> Option<Vec<f32>> {
+    out: &mut Vec<f32>,
+) -> Option<()> {
     if stride == 0 {
         return None;
     }
@@ -121,7 +129,8 @@ fn parse_interleaved_from_stride(
     if stride.is_multiple_of(size_of::<f32>()) {
         let channels = stride / size_of::<f32>();
         if (1..=INPUT_CHANNELS).contains(&channels) {
-            let mut out = Vec::with_capacity(frame_count * INPUT_CHANNELS);
+            out.clear();
+            out.reserve(frame_count * INPUT_CHANNELS);
             for frame in 0..frame_count {
                 let frame_offset = frame * stride;
                 for ch in 0..INPUT_CHANNELS {
@@ -139,28 +148,30 @@ fn parse_interleaved_from_stride(
                     out.push(sample);
                 }
             }
-            return Some(out);
+            return Some(());
         }
     }
 
     if stride.is_multiple_of(size_of::<i16>()) {
         let channels = stride / size_of::<i16>();
         if (1..=INPUT_CHANNELS).contains(&channels) {
-            let mut out = Vec::with_capacity(frame_count * INPUT_CHANNELS);
+            out.clear();
+            out.reserve(frame_count * INPUT_CHANNELS);
             for frame in 0..frame_count {
                 let frame_offset = frame * stride;
                 for ch in 0..INPUT_CHANNELS {
                     let sample = if ch < channels {
                         let base = frame_offset + ch * size_of::<i16>();
                         let value = i16::from_le_bytes([bytes[base], bytes[base + 1]]);
-                        (value as f32) / (i16::MAX as f32)
+                        // Map i16 PCM to [-1.0, 1.0) without overshooting on i16::MIN.
+                        (value as f32) / 32768.0
                     } else {
                         0.0
                     };
                     out.push(sample);
                 }
             }
-            return Some(out);
+            return Some(());
         }
     }
 
@@ -187,7 +198,7 @@ fn run_stdout_output_loop<W: Write>(
     Ok(())
 }
 
-fn build_audio_raw_format_param(format: AudioFormat, channels: u32) -> Vec<u8> {
+fn build_audio_raw_format_param(format: AudioFormat, channels: u32) -> Result<Vec<u8>> {
     let mut audio_info = AudioInfoRaw::new();
     audio_info.set_format(format);
     audio_info.set_rate(SAMPLE_RATE_HZ);
@@ -199,13 +210,13 @@ fn build_audio_raw_format_param(format: AudioFormat, channels: u32) -> Vec<u8> {
         properties: audio_info.into(),
     };
 
-    pw::spa::pod::serialize::PodSerializer::serialize(
+    let serialized = pw::spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
         &pw::spa::pod::Value::Object(obj),
     )
-    .unwrap()
-    .0
-    .into_inner()
+    .context("Failed to serialize PipeWire format pod")?;
+
+    Ok(serialized.0.into_inner())
 }
 
 /// Runs the main PipeWire event loop.
@@ -241,6 +252,9 @@ pub fn run_pipewire_loop(
 
     let data = Arc::new(Mutex::new(input_producer));
     let capture_layout_logged = Arc::new(AtomicBool::new(false));
+    let mut interleaved_scratch = Vec::<f32>::new();
+    let mut planar_channel_scratch: [Vec<f32>; INPUT_CHANNELS] =
+        std::array::from_fn(|_| Vec::new());
 
     // Create stream first
     let capture_stream = pw::stream::Stream::new(&core, "ac3-encoder-capture", props)?;
@@ -282,7 +296,7 @@ pub fn run_pipewire_loop(
                         return;
                     }
 
-                    let mut interleaved = Vec::new();
+                    interleaved_scratch.clear();
 
                     // PipeWire often exposes a single interleaved port even for 5.1.
                     if n_datas == 1 {
@@ -301,14 +315,22 @@ pub fn run_pipewire_loop(
                         }
 
                         if let Some(raw_data) = datas[0].data() {
-                            if let Some(parsed) =
-                                parse_interleaved_from_stride(raw_data, offset, size, stride)
+                            if parse_interleaved_from_stride_into(
+                                raw_data,
+                                offset,
+                                size,
+                                stride,
+                                &mut interleaved_scratch,
+                            )
+                            .is_none()
                             {
-                                interleaved = parsed;
-                            } else if let Some(parsed) =
-                                parse_f32_interleaved(raw_data, offset, size, INPUT_CHANNELS)
-                            {
-                                interleaved = parsed;
+                                let _ = parse_f32_interleaved_into(
+                                    raw_data,
+                                    offset,
+                                    size,
+                                    INPUT_CHANNELS,
+                                    &mut interleaved_scratch,
+                                );
                             }
                         }
                     } else {
@@ -321,11 +343,12 @@ pub fn run_pipewire_loop(
                             );
                         }
                         // Planar input path: gather channels and interleave.
-                        let mut channel_samples: [Vec<f32>; INPUT_CHANNELS] =
-                            std::array::from_fn(|_| Vec::new());
+                        for samples in &mut planar_channel_scratch {
+                            samples.clear();
+                        }
                         let mut samples_per_channel: Option<usize> = None;
 
-                        for (i, samples) in channel_samples
+                        for (i, samples) in planar_channel_scratch
                             .iter_mut()
                             .enumerate()
                             .take(INPUT_CHANNELS.min(n_datas))
@@ -338,16 +361,15 @@ pub fn run_pipewire_loop(
                             }
 
                             if let Some(raw_data) = datas[i].data() {
-                                if let Some(parsed) = parse_f32_plane(raw_data, offset, size) {
-                                    if parsed.is_empty() {
+                                if parse_f32_plane_into(raw_data, offset, size, samples).is_some() {
+                                    if samples.is_empty() {
                                         continue;
                                     }
                                     samples_per_channel = Some(
                                         samples_per_channel
-                                            .map(|n| n.min(parsed.len()))
-                                            .unwrap_or(parsed.len()),
+                                            .map(|n| n.min(samples.len()))
+                                            .unwrap_or(samples.len()),
                                     );
-                                    *samples = parsed;
                                 }
                             }
                         }
@@ -357,20 +379,20 @@ pub fn run_pipewire_loop(
                             Some(n) => n,
                         };
 
-                        interleaved.reserve(n_samples * INPUT_CHANNELS);
+                        interleaved_scratch.reserve(n_samples * INPUT_CHANNELS);
                         for s in 0..n_samples {
-                            for channel in channel_samples.iter().take(INPUT_CHANNELS) {
-                                interleaved.push(channel.get(s).copied().unwrap_or(0.0));
+                            for channel in planar_channel_scratch.iter().take(INPUT_CHANNELS) {
+                                interleaved_scratch.push(channel.get(s).copied().unwrap_or(0.0));
                             }
                         }
                     }
 
-                    if interleaved.is_empty() {
+                    if interleaved_scratch.is_empty() {
                         return;
                     }
 
                     if let Ok(mut producer) = data.try_lock() {
-                        let writable = producer.slots().min(interleaved.len());
+                        let writable = producer.slots().min(interleaved_scratch.len());
                         let frame_aligned_writable = writable - (writable % INPUT_CHANNELS);
                         if frame_aligned_writable == 0 {
                             return;
@@ -378,7 +400,10 @@ pub fn run_pipewire_loop(
 
                         if let Ok(chunk) = producer.write_chunk_uninit(frame_aligned_writable) {
                             chunk.fill_from_iter(
-                                interleaved.into_iter().take(frame_aligned_writable),
+                                interleaved_scratch
+                                    .iter()
+                                    .take(frame_aligned_writable)
+                                    .copied(),
                             );
                         }
                     }
@@ -390,8 +415,10 @@ pub fn run_pipewire_loop(
     // Connect Capture Stream
     // Connect Capture Stream
     let capture_format_bytes =
-        build_audio_raw_format_param(AudioFormat::F32LE, INPUT_CHANNELS as u32);
-    let mut capture_params = [pw::spa::pod::Pod::from_bytes(&capture_format_bytes).unwrap()];
+        build_audio_raw_format_param(AudioFormat::F32LE, INPUT_CHANNELS as u32)?;
+    let capture_format_pod = pw::spa::pod::Pod::from_bytes(&capture_format_bytes)
+        .ok_or_else(|| anyhow!("Failed to parse capture format pod bytes"))?;
+    let mut capture_params = [capture_format_pod];
     capture_stream.connect(
         Direction::Input,
         None,
@@ -508,8 +535,10 @@ pub fn run_pipewire_loop(
             .register()?;
 
         let playback_format_bytes =
-            build_audio_raw_format_param(AudioFormat::S16LE, OUTPUT_CHANNELS as u32);
-        let mut playback_params = [pw::spa::pod::Pod::from_bytes(&playback_format_bytes).unwrap()];
+            build_audio_raw_format_param(AudioFormat::S16LE, OUTPUT_CHANNELS as u32)?;
+        let playback_format_pod = pw::spa::pod::Pod::from_bytes(&playback_format_bytes)
+            .ok_or_else(|| anyhow!("Failed to parse playback format pod bytes"))?;
+        let mut playback_params = [playback_format_pod];
         // Connect Playback Stream
         playback_stream.connect(
             Direction::Output,

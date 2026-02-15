@@ -57,8 +57,7 @@ pub fn run_encoder_loop(
     let running_feeder = running.clone();
 
     // Spawn Feeder Thread (RingBuffer -> Stdin)
-    let feeder_handle = thread::spawn(move || {
-        let mut _buffer = vec![0.0f32; 1024 * 6]; // Chunk size
+    let feeder_handle = thread::spawn(move || -> Result<()> {
         let mut byte_buffer = Vec::with_capacity(1024 * 6 * 4);
 
         while running_feeder.load(Ordering::Relaxed) {
@@ -75,7 +74,9 @@ pub fn run_encoder_loop(
 
                     // Write to stdin
                     if let Err(e) = stdin.write_all(&byte_buffer) {
-                        error!("Failed to write to ffmpeg stdin: {}", e);
+                        if running_feeder.load(Ordering::Relaxed) {
+                            return Err(anyhow!(e).context("Failed to write to ffmpeg stdin"));
+                        }
                         break;
                     }
                 } else {
@@ -85,16 +86,22 @@ pub fn run_encoder_loop(
                 thread::sleep(Duration::from_millis(1));
             }
         }
+
+        Ok(())
     });
 
     // Run Reader Loop (Stdout -> RingBuffer) in this thread
     let mut read_buffer = [0u8; 4096];
+    let mut reader_error: Option<anyhow::Error> = None;
 
     loop {
         // Read from stdout
         match stdout.read(&mut read_buffer) {
             Ok(0) => {
-                warn!("FFmpeg stdout closed unexpectedly.");
+                if running.load(Ordering::Relaxed) {
+                    warn!("FFmpeg stdout closed unexpectedly.");
+                    reader_error = Some(anyhow!("FFmpeg stdout closed unexpectedly"));
+                }
                 break;
             }
             Ok(n) => {
@@ -138,30 +145,67 @@ pub fn run_encoder_loop(
                 }
             }
             Err(e) => {
-                error!("Error reading ffmpeg stdout: {}", e);
+                if running.load(Ordering::Relaxed) {
+                    error!("Error reading ffmpeg stdout: {}", e);
+                    reader_error = Some(anyhow!(e).context("Error reading ffmpeg stdout"));
+                }
                 break;
             }
         }
     }
 
     info!("Stopping ffmpeg...");
-    let _ = feeder_handle.join();
+    match feeder_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            if reader_error.is_none() {
+                reader_error = Some(e);
+            }
+        }
+        Err(e) => {
+            if reader_error.is_none() {
+                reader_error = Some(anyhow!("Encoder feeder thread panicked: {:?}", e));
+            }
+        }
+    }
+
     let deadline = Instant::now() + Duration::from_millis(500);
-    loop {
+    let mut forced_kill = false;
+    let child_status = loop {
         match child.try_wait() {
-            Ok(Some(_status)) => break,
+            Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    forced_kill = true;
                     let _ = child.kill();
-                    let _ = child.wait();
-                    break;
+                    break child.wait().ok();
                 }
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => {
+            Err(e) => {
+                if reader_error.is_none() {
+                    reader_error =
+                        Some(anyhow!(e).context("Failed to query ffmpeg process status"));
+                }
+                forced_kill = true;
                 let _ = child.kill();
-                let _ = child.wait();
-                break;
+                break child.wait().ok();
+            }
+        }
+    };
+
+    if running.load(Ordering::Relaxed) {
+        if let Some(err) = reader_error {
+            return Err(err);
+        }
+        if forced_kill {
+            return Err(anyhow!(
+                "FFmpeg process did not terminate in time and was killed"
+            ));
+        }
+        if let Some(status) = child_status {
+            if !status.success() {
+                return Err(anyhow!("FFmpeg exited with status: {status}"));
             }
         }
     }

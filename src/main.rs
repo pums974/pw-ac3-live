@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use log::{info, warn};
 use rtrb::RingBuffer;
@@ -71,17 +71,33 @@ fn main() -> Result<()> {
 
     // 4. Start PipeWire Client (Main Thread or blocked)
     // logic to connect to PipeWire...
-    pipewire_client::run_pipewire_loop(
+    let pipewire_result = pipewire_client::run_pipewire_loop(
         input_producer,
         output_consumer,
         args.target,
         args.stdout,
-        running,
-    )?;
+        running.clone(),
+    );
 
-    // Wait for encoder to finish if it hasn't already
-    if let Err(e) = encoder_handle.join() {
-        warn!("Encoder thread panicked: {:?}", e);
+    // Always request shutdown and join the encoder thread, even if PipeWire init failed.
+    running.store(false, Ordering::SeqCst);
+
+    let encoder_result = match encoder_handle.join() {
+        Ok(result) => result,
+        Err(e) => Err(anyhow!("Encoder thread panicked: {e:?}")),
+    };
+
+    if let Err(e) = pipewire_result {
+        if let Err(encoder_err) = encoder_result {
+            return Err(e).context(format!(
+                "Encoder also failed while handling PipeWire failure: {encoder_err:#}"
+            ));
+        }
+        return Err(e);
+    }
+
+    if let Err(e) = encoder_result {
+        return Err(e).context("Encoder loop failed");
     }
 
     info!("Exiting.");

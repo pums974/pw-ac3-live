@@ -9,6 +9,34 @@ mod pipewire_client_impl {
         use std::mem::size_of;
         use std::sync::atomic::AtomicBool;
 
+        fn parse_f32_plane(raw_data: &[u8], offset: usize, size: usize) -> Option<Vec<f32>> {
+            let mut samples = Vec::new();
+            parse_f32_plane_into(raw_data, offset, size, &mut samples)?;
+            Some(samples)
+        }
+
+        fn parse_f32_interleaved(
+            raw_data: &[u8],
+            offset: usize,
+            size: usize,
+            channels: usize,
+        ) -> Option<Vec<f32>> {
+            let mut samples = Vec::new();
+            parse_f32_interleaved_into(raw_data, offset, size, channels, &mut samples)?;
+            Some(samples)
+        }
+
+        fn parse_interleaved_from_stride(
+            raw_data: &[u8],
+            offset: usize,
+            size: usize,
+            stride: usize,
+        ) -> Option<Vec<f32>> {
+            let mut samples = Vec::new();
+            parse_interleaved_from_stride_into(raw_data, offset, size, stride, &mut samples)?;
+            Some(samples)
+        }
+
         #[test]
         fn parse_f32_plane_accepts_valid_aligned_chunk() {
             let data = [0.5f32, -1.25f32, 3.0f32];
