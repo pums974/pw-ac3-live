@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Manages the FFmpeg subprocess for encoding.
 ///
@@ -90,7 +90,7 @@ pub fn run_encoder_loop(
     // Run Reader Loop (Stdout -> RingBuffer) in this thread
     let mut read_buffer = [0u8; 4096];
 
-    while running.load(Ordering::Relaxed) {
+    loop {
         // Read from stdout
         match stdout.read(&mut read_buffer) {
             Ok(0) => {
@@ -101,9 +101,11 @@ pub fn run_encoder_loop(
                 // Write to RingBuffer
                 // We need to write all `n` bytes.
                 let mut bytes_written = 0;
+                let mut abort_due_to_shutdown_backpressure = false;
                 while bytes_written < n {
                     if output.slots() > 0 {
-                        match output.write_chunk_uninit(n - bytes_written) {
+                        let request = (n - bytes_written).min(output.slots());
+                        match output.write_chunk_uninit(request) {
                             Ok(chunk) => {
                                 let to_write = chunk.len();
                                 chunk.fill_from_iter(
@@ -115,13 +117,24 @@ pub fn run_encoder_loop(
                             }
                             Err(_) => {
                                 // Full
+                                if !running.load(Ordering::Relaxed) {
+                                    abort_due_to_shutdown_backpressure = true;
+                                    break;
+                                }
                                 thread::sleep(Duration::from_micros(100));
                             }
                         }
                     } else {
-                        warn!("Output RingBuffer full!");
+                        if !running.load(Ordering::Relaxed) {
+                            abort_due_to_shutdown_backpressure = true;
+                            break;
+                        }
                         thread::sleep(Duration::from_millis(1));
                     }
+                }
+
+                if abort_due_to_shutdown_backpressure {
+                    break;
                 }
             }
             Err(e) => {
@@ -132,8 +145,26 @@ pub fn run_encoder_loop(
     }
 
     info!("Stopping ffmpeg...");
-    let _ = child.kill();
     let _ = feeder_handle.join();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
 
     Ok(())
 }

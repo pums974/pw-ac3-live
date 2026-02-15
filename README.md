@@ -1,71 +1,91 @@
 # PipeWire AC-3 Live Encoder
 
-A real-time 5.1 LPCM to AC-3 (Dolby Digital) encoder for PipeWire.
+`pw-ac3-live` is a real-time 5.1 LPCM to AC-3 (Dolby Digital) encoder for PipeWire.
 
 ## Purpose
-This project solves a hardware limitation on SteamOS (Steam Deck + Dock) where the HDMI sink (TV/AVR) only advertises 2-channel PCM support via EDID, but supports AC-3 passthrough. `pw-ac3-live` creates a virtual 5.1 surround sink, encodes the audio to AC-3 in real-time using FFmpeg, and outputs an IEC61937-encapsulated stream to the physical HDMI device.
+Some HDMI sinks expose only stereo PCM but still accept AC-3 passthrough. This project creates a virtual 5.1 sink, encodes incoming audio to AC-3 with `ffmpeg`, and outputs an IEC61937 stream for playback.
 
-## Architecture
-- **Language**: Rust
-- **Audio Server**: PipeWire (via `pipewire-rs`)
-- **Encoding**: FFmpeg (via `ffmpeg-next`, `libavcodec`)
-- **Concurrency**: Lock-free Ring Buffer (`rtrb`) connecting the RT-safe capture thread and the encoding thread.
-
-## Prerequisites
-- PipeWire
-- FFmpeg libraries (`libavcodec`, `libavutil`, `libavformat`)
+## Requirements
 - Rust toolchain
+- PipeWire
+- `ffmpeg` binary with AC-3 encoder and `spdif` muxer support
+- PipeWire CLI tools for local testing (`pw-play`, `pw-record`, `pw-link`, `pw-cli`, `pactl`)
 
-## Usage
-
-### Running Locally
+## Build
 ```bash
-# Build and run with release optimizations
-cargo run --release
-
-# To see debug logs
-RUST_LOG=debug cargo run --release
+cargo build --release
 ```
 
-## Testing & Verification
+## Run
+```bash
+# Default PipeWire playback mode
+cargo run --release
 
-### Automated Tests
-This project includes a suite of unit tests and a CI pipeline.
+# With logs
+RUST_LOG=info cargo run --release
+```
 
-1.  **Run Tests Locally**:
-    ```bash
-    cargo test
-    ```
-    *Note: Requires `ffmpeg` to be installed.*
+### CLI options
+```bash
+# Explicit playback target by node name
+cargo run --release -- --target alsa_output.pci-0000_03_00.1.hdmi-stereo
 
-2.  **Continuous Integration**:
-    Each push to `main` triggers a GitHub Actions workflow that runs `cargo test`, `cargo clippy`, and `cargo fmt`.
+# Explicit playback target by numeric object ID
+cargo run --release -- --target 42
 
-### Manual Verification
-1.  **Run the Daemon**: Start the application using the command above.
-2.  **Verify Nodes**:
-    *   Run `pw-dot` or open a graph tool like `qpwgraph` or `Helvum`.
-    *   Look for `pw-ac3-live-input` (Sink) and `pw-ac3-live-output` (Source).
-3.  **Connect Audio**:
-    *   Open PulseAudio Volume Control (`pavucontrol`).
-    *   In the **Playback** tab, locate your 5.1 audio source (e.g., a game or media player).
-    *   Change its output device to **AC-3 Encoder Input**.
-4.  **Connect Output**:
-    *   **Manual Action Required**: In `qpwgraph`/`Helvum`, explicitly connect `pw-ac3-live-output` to your physical HDMI/S/PDIF sink.
-    *   Ensure your physical sink is set to a profile (like "Digital Stereo (IEC958)") that accepts the stream.
+# Write IEC61937 bytes to stdout (no PipeWire playback stream)
+cargo run --release -- --stdout > output.spdif
+```
 
-## Troubleshooting
+`--target` accepts either a node name or a numeric object ID. Numeric values are applied to both the stream connect target and `target.object` properties. Name values are applied as `target.object`.
 
--   **No Audio / Silence**:
-    -   Check if the application is running (it logs "PipeWire loop running").
-    -   Verify `pw-ac3-live-output` is connected to a physical sink.
-    -   Ensure the physical sink is not muted.
--   **Underruns / Glitches**:
-    -   Run in `--release` mode. Debug builds are too slow for real-time encoding.
-    -   Check system load. AC-3 encoding is CPU intensive.
--   **FFmpeg Errors**:
-    -   Check the terminal output. The application inherits FFmpeg's stderr, so you will see encoding errors directly.
-    -   Ensure `ffmpeg` is installed and supports `ac3` and `spdif` muxer (`ffmpeg -formats | grep spdif`).
+`--stdout` mode drains buffered encoder output and exits cleanly on shutdown.
+
+## Runtime nodes
+- Input node: `pw-ac3-live-input` (PipeWire sink, 6 channels, F32LE)
+- Output node: `pw-ac3-live-output` (PipeWire source, S16LE IEC61937 payload) unless `--stdout` is enabled
+
+The capture side supports both layouts commonly exposed by PipeWire:
+- single interleaved buffer (`datas=1`, typically with stride),
+- multi-buffer planar input.
+
+## Testing
+```bash
+# Full test suite
+cargo test
+
+# Encoder-focused tests
+cargo test --test encoder_tests
+
+# PipeWire client behavior and parsing tests
+cargo test --test pipewire_client_tests
+```
+
+Notable regression coverage includes:
+- encoder shutdown under output backpressure,
+- safe F32 parsing for planar and interleaved capture buffers (alignment/range assumptions),
+- playback target resolution (`--target` numeric/name),
+- stdout output loop shutdown behavior.
+
+For end-to-end local verification, see `docs/TESTING.md`.
+
+Quick integration scripts:
+```bash
+# Stdout pipeline + sink monitor capture (intermediate IEC validation)
+./scripts/test_local_pipeline.sh
+
+# Native PipeWire playback stream + direct output capture (strict IEC validation)
+./scripts/test_pipewire_pipeline.sh
+```
+
+In local script output, `output.spdif` is captured from sink monitor/mix path and may not preserve
+IEC sync words. `intermediate.raw` is the authoritative encoder bitstream artifact.
+
+## Manual output connection helper
+If you want to connect output ports manually from the shell:
+```bash
+./scripts/connect.sh <target-node-name-pattern>
+```
 
 ## License
 MIT / Apache-2.0

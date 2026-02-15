@@ -21,12 +21,15 @@ To ensure glitch-free audio, we strictly separate real-time (RT) tasks from comp
 *   **Context**: PipeWire `process` callback.
 *   **Priority**: Real-time (SCHED_FIFO).
 *   **Constraints**: 
-    *   NO allocations (malloc/free).
-    *   NO mutex locking.
-    *   NO syscalls (e.g., I/O).
+    *   Avoid blocking operations.
+    *   Avoid long critical sections.
+    *   Keep callback work bounded to prevent xruns.
 *   **Responsibility**: 
-    *   Deinterleave input audio if necessary.
-    *   Write raw samples to the `InputRingBuffer`.
+    *   Read 6-channel capture input (`F32LE`) from PipeWire buffers.
+    *   Parse either:
+        * single interleaved buffer (`datas=1`, stride-based), or
+        * multi-buffer planar layout.
+    *   Validate buffer boundaries/alignment and write frame-aligned samples to the `InputRingBuffer`.
 
 ### 2. Encoder Mechanism (Subprocess)
 *   **Component**: `ffmpeg` binary spawned as a child process.
@@ -41,6 +44,7 @@ To ensure glitch-free audio, we strictly separate real-time (RT) tasks from comp
 *   **Responsibility**:
     *   **Feeder**: Moves data from InputRingBuffer to FFmpeg's stdin.
     *   **Reader**: Moves data from FFmpeg's stdout to OutputRingBuffer.
+    *   **Shutdown behavior**: Handles output backpressure and exits promptly when shutdown is requested, even if the output ring is full.
 
 ### 4. Playback Thread (RT-Safe)
 *   **Context**: PipeWire `process` callback.
@@ -50,16 +54,20 @@ To ensure glitch-free audio, we strictly separate real-time (RT) tasks from comp
     *   Read encoded IEC 61937 frames from `OutputRingBuffer`.
     *   Write to the PipeWire buffer for the HDMI sink.
     *   Handle underruns by writing zero-padding (silence) to maintain clock sync.
+    *   Keep PipeWire stream listener/callback handles alive for the whole loop lifetime.
 
 ## Interaction with PipeWire
-*   **Virtual Sink**: The application creates a virtual sink node that games/apps can link to.
-*   **Passthrough**: The application connects its output node directly to the hardware HDMI/SPDIF node, negotiating the `audio/x-ac3` or `audio/x-iec958-data` format.
+*   **Virtual Sink**: The application creates `pw-ac3-live-input` (Audio/Sink, 6ch @ 48kHz).
+*   **Virtual Source**: In native mode it creates `pw-ac3-live-output` (Audio/Source, 2ch S16LE carrying IEC61937 payload).
+*   **Playback Targeting**: Output can be routed by explicit `--target` (node name or numeric object ID), or emitted to stdout in `--stdout` mode.
 
 ## Latency Considerations
 *   **Buffering**: The RingBuffer must be large enough to absorb jitter between the RT thread and the Encoder thread, but small enough to minimize AV sync issues. 
 *   **Target**: < 50ms total system latency.
 
 ## Testing Strategy
-*   **Unit Tests**: The `encoder` module is tested in isolation (`tests/encoder_tests.rs`) by mocking input data and verifying MP4/AC-3 output presence from the FFmpeg subprocess.
-*   **Integration/System Tests**: Due to the dependency on a running PipeWire daemon and hardware sinks, full system verification is currently manual (see `README.md`).
+*   **Encoder Tests**: `tests/encoder_tests.rs` validates throughput, restart/shutdown behavior, IEC61937 preamble presence, and shutdown under output backpressure.
+*   **PipeWire Client Tests**: `tests/pipewire_client_tests.rs` validates safe audio buffer parsing, playback target resolution, and stdout loop shutdown semantics.
+*   **Local End-to-End Script**: `scripts/test_local_pipeline.sh` validates encoder output and graph wiring with a null sink plus monitor capture.
+*   **Native End-to-End Script**: `scripts/test_pipewire_pipeline.sh` validates strict IEC61937 presence from the native `pw-ac3-live-output` stream.
 *   **CI**: GitHub Actions validates the build, formatting, and unit tests on every commit.

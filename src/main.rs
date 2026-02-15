@@ -20,6 +20,10 @@ struct Args {
     #[arg(short, long)]
     target: Option<String>,
 
+    /// Output to stdout instead of PipeWire playback
+    #[arg(long, action)]
+    stdout: bool,
+
     /// Ring buffer capacity in audio frames (samples per channel)
     /// Default is approx 100ms at 48kHz
     #[arg(short, long, default_value_t = 4800)]
@@ -67,7 +71,13 @@ fn main() -> Result<()> {
 
     // 4. Start PipeWire Client (Main Thread or blocked)
     // logic to connect to PipeWire...
-    pipewire_client::run_pipewire_loop(input_producer, output_consumer, args.target, running)?;
+    pipewire_client::run_pipewire_loop(
+        input_producer,
+        output_consumer,
+        args.target,
+        args.stdout,
+        running,
+    )?;
 
     // Wait for encoder to finish if it hasn't already
     if let Err(e) = encoder_handle.join() {
