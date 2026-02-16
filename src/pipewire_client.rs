@@ -204,6 +204,24 @@ fn build_audio_raw_format_param(format: AudioFormat, channels: u32) -> Result<Ve
     audio_info.set_rate(SAMPLE_RATE_HZ);
     audio_info.set_channels(channels);
 
+    // Explicitly set channel map to ensure correct port creation.
+    // Using raw values from libspa::sys because AudioChannel enum is not stable/exposed in 0.8
+    if channels == 6 {
+        let mut position = [0u32; 64];
+        position[0] = libspa::sys::SPA_AUDIO_CHANNEL_FL;
+        position[1] = libspa::sys::SPA_AUDIO_CHANNEL_FR;
+        position[2] = libspa::sys::SPA_AUDIO_CHANNEL_FC;
+        position[3] = libspa::sys::SPA_AUDIO_CHANNEL_LFE;
+        position[4] = libspa::sys::SPA_AUDIO_CHANNEL_SL;
+        position[5] = libspa::sys::SPA_AUDIO_CHANNEL_SR;
+        audio_info.set_position(position);
+    } else if channels == 2 {
+        let mut position = [0u32; 64];
+        position[0] = libspa::sys::SPA_AUDIO_CHANNEL_FL;
+        position[1] = libspa::sys::SPA_AUDIO_CHANNEL_FR;
+        audio_info.set_position(position);
+    }
+
     let obj = pw::spa::pod::Object {
         type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: pw::spa::param::ParamType::EnumFormat.as_raw(),
