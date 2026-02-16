@@ -9,8 +9,8 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 LOW_LATENCY_BUFFER_SIZE="${PW_AC3_BUFFER_SIZE:-960}"
 LOW_LATENCY_OUTPUT_BUFFER_SIZE="${PW_AC3_OUTPUT_BUFFER_SIZE:-}"
 LOW_LATENCY_NODE_LATENCY="${PW_AC3_NODE_LATENCY:-64/48000}"
-LOW_LATENCY_THREAD_QUEUE="${PW_AC3_FFMPEG_THREAD_QUEUE_SIZE:-16}"
-LOW_LATENCY_CHUNK_FRAMES="${PW_AC3_FFMPEG_CHUNK_FRAMES:-64}"
+LOW_LATENCY_THREAD_QUEUE="${PW_AC3_FFMPEG_THREAD_QUEUE_SIZE:-32}"
+LOW_LATENCY_CHUNK_FRAMES="${PW_AC3_FFMPEG_CHUNK_FRAMES:-128}"
 ENABLE_LATENCY_PROFILE="${PW_AC3_PROFILE_LATENCY:-0}"
 TARGET_SINK_OVERRIDE="${PW_AC3_TARGET_SINK:-}"
 APP_BIN="${ROOT_DIR}/bin/pw-ac3-live"
@@ -57,6 +57,22 @@ normalize_pw_ac3_live_levels() {
     done
 
     echo "Warning: Could not find pw-ac3-live playback sink-input; leaving stream volume unchanged."
+}
+
+move_existing_streams_to_encoder_input() {
+    echo "Moving existing app streams to 'AC-3 Encoder Input'..."
+    local encoder_stream_id=""
+    encoder_stream_id=$(find_pw_ac3_live_sink_input_id || true)
+
+    while read -r stream_id _; do
+        [ -z "$stream_id" ] && continue
+        if [ -n "$encoder_stream_id" ] && [ "$stream_id" = "$encoder_stream_id" ]; then
+            continue
+        fi
+        if pactl move-sink-input "$stream_id" "pw-ac3-live-input" >/dev/null 2>&1; then
+            echo "Moved sink-input #$stream_id to pw-ac3-live-input."
+        fi
+    done < <(pactl list sink-inputs short)
 }
 
 find_best_hdmi_sink_line() {
@@ -276,6 +292,9 @@ if command -v wpctl >/dev/null 2>&1; then
 else
     echo "Warning: wpctl not found; skipping wpctl default set."
 fi
+
+# Re-route already-running app streams that might still be pinned to old sinks.
+move_existing_streams_to_encoder_input
 
 # 8. Ensure Link (Output -> HDMI)
 echo "Ensuring encoder output is linked to HDMI..."

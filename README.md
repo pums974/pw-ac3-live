@@ -229,6 +229,26 @@ wpctl status
 pw-link -l
 ```
 
+### Audio is laggy and choppy (Steam Deck)
+Try this balanced launcher profile first:
+```bash
+PW_AC3_BUFFER_SIZE=480 \
+PW_AC3_OUTPUT_BUFFER_SIZE=960 \
+PW_AC3_NODE_LATENCY=32/48000 \
+PW_AC3_FFMPEG_THREAD_QUEUE_SIZE=32 \
+PW_AC3_FFMPEG_CHUNK_FRAMES=128 \
+./scripts/launch_live.sh
+```
+
+If audio is still choppy, increase only output buffering:
+```bash
+PW_AC3_OUTPUT_BUFFER_SIZE=1920 ./scripts/launch_live.sh
+```
+
+Notes:
+- `launch_live.sh` now moves existing sink-input streams to `pw-ac3-live-input`, so apps started before the script are less likely to corrupt HDMI AC-3 passthrough.
+- `latency[pipewire] playback.underruns` should remain near zero; if it climbs quickly, increase `PW_AC3_OUTPUT_BUFFER_SIZE`.
+
 ### Audio drops or glitches
 Increase ring buffer size:
 ```bash

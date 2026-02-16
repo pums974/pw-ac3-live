@@ -717,7 +717,8 @@ pub fn run_pipewire_loop_with_config(
                                     * 1000.0;
                                 bytes_to_copy = (available.min(max_writable) / OUTPUT_FRAME_BYTES)
                                     * OUTPUT_FRAME_BYTES;
-                                let underrun = bytes_to_copy == 0 && max_writable > 0;
+                                // Treat partial fills as underruns too: they also indicate starvation.
+                                let underrun = bytes_to_copy < max_writable && max_writable > 0;
 
                                 if bytes_to_copy > 0 {
                                     if let Ok(chunk) = consumer.read_chunk(bytes_to_copy) {
