@@ -3,10 +3,12 @@ set -e
 
 # Goal: Setup HDMI for AC3 passthrough and launch the encoder
 
-LOW_LATENCY_BUFFER_SIZE="${PW_AC3_BUFFER_SIZE:-4800}"
+LOW_LATENCY_BUFFER_SIZE="${PW_AC3_BUFFER_SIZE:-960}"
+LOW_LATENCY_OUTPUT_BUFFER_SIZE="${PW_AC3_OUTPUT_BUFFER_SIZE:-}"
 LOW_LATENCY_NODE_LATENCY="${PW_AC3_NODE_LATENCY:-64/48000}"
-LOW_LATENCY_THREAD_QUEUE="${PW_AC3_FFMPEG_THREAD_QUEUE_SIZE:-128}"
-LOW_LATENCY_CHUNK_FRAMES="${PW_AC3_FFMPEG_CHUNK_FRAMES:-128}"
+LOW_LATENCY_THREAD_QUEUE="${PW_AC3_FFMPEG_THREAD_QUEUE_SIZE:-16}"
+LOW_LATENCY_CHUNK_FRAMES="${PW_AC3_FFMPEG_CHUNK_FRAMES:-64}"
+ENABLE_LATENCY_PROFILE="${PW_AC3_PROFILE_LATENCY:-0}"
 
 find_pw_ac3_live_sink_input_id() {
     pactl list sink-inputs | awk '
@@ -120,6 +122,17 @@ configure_hdmi_passthrough "$SINK_INDEX"
 
 # 5. Launch Application
 echo "Launching pw-ac3-live..."
+PROFILE_LATENCY_ARGS=()
+if [ "$ENABLE_LATENCY_PROFILE" = "1" ]; then
+    echo "Latency profiling enabled."
+    PROFILE_LATENCY_ARGS+=(--profile-latency)
+fi
+
+OUTPUT_BUFFER_ARGS=()
+if [ -n "$LOW_LATENCY_OUTPUT_BUFFER_SIZE" ]; then
+    echo "Output buffer override: $LOW_LATENCY_OUTPUT_BUFFER_SIZE frames"
+    OUTPUT_BUFFER_ARGS+=(--output-buffer-size "$LOW_LATENCY_OUTPUT_BUFFER_SIZE")
+fi
 # Run in background, assuming 'cargo' is in path. 
 # We use nohup or just backgrounding to keep it running? 
 # The user wants "one click", so maybe keep the terminal open or detach?
@@ -130,7 +143,9 @@ RUST_LOG=info cargo run --release -- --target "$SINK_NAME" \
     --buffer-size "$LOW_LATENCY_BUFFER_SIZE" \
     --latency "$LOW_LATENCY_NODE_LATENCY" \
     --ffmpeg-thread-queue-size "$LOW_LATENCY_THREAD_QUEUE" \
-    --ffmpeg-chunk-frames "$LOW_LATENCY_CHUNK_FRAMES" &
+    --ffmpeg-chunk-frames "$LOW_LATENCY_CHUNK_FRAMES" \
+    "${OUTPUT_BUFFER_ARGS[@]}" \
+    "${PROFILE_LATENCY_ARGS[@]}" &
 APP_PID=$!
 echo "App launched with PID $APP_PID"
 
