@@ -3,12 +3,18 @@ set -e
 
 # Goal: Setup HDMI for AC3 passthrough and launch the encoder
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 LOW_LATENCY_BUFFER_SIZE="${PW_AC3_BUFFER_SIZE:-960}"
 LOW_LATENCY_OUTPUT_BUFFER_SIZE="${PW_AC3_OUTPUT_BUFFER_SIZE:-}"
 LOW_LATENCY_NODE_LATENCY="${PW_AC3_NODE_LATENCY:-64/48000}"
 LOW_LATENCY_THREAD_QUEUE="${PW_AC3_FFMPEG_THREAD_QUEUE_SIZE:-16}"
 LOW_LATENCY_CHUNK_FRAMES="${PW_AC3_FFMPEG_CHUNK_FRAMES:-64}"
 ENABLE_LATENCY_PROFILE="${PW_AC3_PROFILE_LATENCY:-0}"
+APP_BIN="${ROOT_DIR}/bin/pw-ac3-live"
+DEV_BIN="${ROOT_DIR}/target/release/pw-ac3-live"
+USE_PACKAGED_BINARY=0
 
 find_pw_ac3_live_sink_input_id() {
     pactl list sink-inputs | awk '
@@ -133,19 +139,51 @@ if [ -n "$LOW_LATENCY_OUTPUT_BUFFER_SIZE" ]; then
     echo "Output buffer override: $LOW_LATENCY_OUTPUT_BUFFER_SIZE frames"
     OUTPUT_BUFFER_ARGS+=(--output-buffer-size "$LOW_LATENCY_OUTPUT_BUFFER_SIZE")
 fi
-# Run in background, assuming 'cargo' is in path. 
-# We use nohup or just backgrounding to keep it running? 
-# The user wants "one click", so maybe keep the terminal open or detach?
-# If we run from terminal script, we probably want to see logs.
-# Let's run it in foreground? No, the prompt implied we might want to do post-setup.
-# So run in background, capture PID.
-RUST_LOG=info cargo run --release -- --target "$SINK_NAME" \
-    --buffer-size "$LOW_LATENCY_BUFFER_SIZE" \
-    --latency "$LOW_LATENCY_NODE_LATENCY" \
-    --ffmpeg-thread-queue-size "$LOW_LATENCY_THREAD_QUEUE" \
-    --ffmpeg-chunk-frames "$LOW_LATENCY_CHUNK_FRAMES" \
-    "${OUTPUT_BUFFER_ARGS[@]}" \
-    "${PROFILE_LATENCY_ARGS[@]}" &
+
+if [ -x "$APP_BIN" ]; then
+    echo "Using packaged binary: $APP_BIN"
+    USE_PACKAGED_BINARY=1
+elif [ -x "$DEV_BIN" ]; then
+    echo "Using local release binary: $DEV_BIN"
+else
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "Error: No packaged/release binary found and 'cargo' is not installed."
+        echo "Expected one of:"
+        echo "  $APP_BIN"
+        echo "  $DEV_BIN"
+        exit 1
+    fi
+    echo "No prebuilt binary found, falling back to cargo run --release."
+fi
+
+if [ "$USE_PACKAGED_BINARY" = "1" ]; then
+    RUST_LOG=info "$APP_BIN" \
+        --target "$SINK_NAME" \
+        --buffer-size "$LOW_LATENCY_BUFFER_SIZE" \
+        --latency "$LOW_LATENCY_NODE_LATENCY" \
+        --ffmpeg-thread-queue-size "$LOW_LATENCY_THREAD_QUEUE" \
+        --ffmpeg-chunk-frames "$LOW_LATENCY_CHUNK_FRAMES" \
+        "${OUTPUT_BUFFER_ARGS[@]}" \
+        "${PROFILE_LATENCY_ARGS[@]}" &
+elif [ -x "$DEV_BIN" ]; then
+    RUST_LOG=info "$DEV_BIN" \
+        --target "$SINK_NAME" \
+        --buffer-size "$LOW_LATENCY_BUFFER_SIZE" \
+        --latency "$LOW_LATENCY_NODE_LATENCY" \
+        --ffmpeg-thread-queue-size "$LOW_LATENCY_THREAD_QUEUE" \
+        --ffmpeg-chunk-frames "$LOW_LATENCY_CHUNK_FRAMES" \
+        "${OUTPUT_BUFFER_ARGS[@]}" \
+        "${PROFILE_LATENCY_ARGS[@]}" &
+else
+    RUST_LOG=info cargo run --release -- \
+        --target "$SINK_NAME" \
+        --buffer-size "$LOW_LATENCY_BUFFER_SIZE" \
+        --latency "$LOW_LATENCY_NODE_LATENCY" \
+        --ffmpeg-thread-queue-size "$LOW_LATENCY_THREAD_QUEUE" \
+        --ffmpeg-chunk-frames "$LOW_LATENCY_CHUNK_FRAMES" \
+        "${OUTPUT_BUFFER_ARGS[@]}" \
+        "${PROFILE_LATENCY_ARGS[@]}" &
+fi
 APP_PID=$!
 echo "App launched with PID $APP_PID"
 
@@ -182,7 +220,7 @@ pactl set-default-sink "pw-ac3-live-input" || echo "Warning: Could not set defau
 
 # 8. Ensure Link (Output -> HDMI)
 echo "Ensuring encoder output is linked to HDMI..."
-./scripts/connect.sh "$SINK_NAME"
+"${SCRIPT_DIR}/connect.sh" "$SINK_NAME"
 
 # 9. Enforce bitstream-safe runtime levels after graph creation
 normalize_pw_ac3_live_levels
