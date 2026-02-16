@@ -39,9 +39,13 @@ cargo run --release -- --stdout > output.spdif
 # Lower latency profile (good starting point)
 cargo run --release -- --target <your-hdmi-node> \
   --buffer-size 960 \
+  --output-buffer-size 960 \
   --latency 32/48000 \
   --ffmpeg-thread-queue-size 16 \
   --ffmpeg-chunk-frames 128
+
+# Enable per-stage latency profiling logs (once per second)
+cargo run --release -- --target <your-hdmi-node> --profile-latency
 ```
 
 `--target` accepts either a node name or a numeric object ID. Numeric values are applied to both the stream connect target and `target.object` properties. Name values are applied as `target.object`.
@@ -50,9 +54,19 @@ cargo run --release -- --target <your-hdmi-node> \
 
 Latency-related knobs:
 - `--buffer-size`: app ring buffer size in frames (default `4800`).
+- `--output-buffer-size`: playback/output ring buffer size in frames (default: same as `--buffer-size`).
 - `--latency`: PipeWire node latency target (default `64/48000`).
 - `--ffmpeg-thread-queue-size`: FFmpeg input queue depth (default `128`).
 - `--ffmpeg-chunk-frames`: frame batch size written to FFmpeg (default `128`).
+- `--profile-latency`: emits per-stage latency stats (`avg/p50/p95/max`) every second.
+
+With the launcher script:
+```bash
+PW_AC3_PROFILE_LATENCY=1 ./scripts/launch_live.sh
+
+# Optional: lower output ring independently (frames)
+PW_AC3_OUTPUT_BUFFER_SIZE=960 ./scripts/launch_live.sh
+```
 
 ## Fresh Start (Recommended)
 Use this section if you want to reset your setup and start from zero.

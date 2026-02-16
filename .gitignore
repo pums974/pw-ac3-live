@@ -1,1 +1,8 @@
 /target
+/dist
+*.wav
+*.log
+*.tar.gz
+*.dot
+*.spdif
+*.raw

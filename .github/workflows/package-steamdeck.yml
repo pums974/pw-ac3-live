@@ -1,0 +1,56 @@
+name: Package Steam Deck
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package-steamdeck:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libclang-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Rust Build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Steam Deck Package
+        env:
+          TARGET_TRIPLE: x86_64-unknown-linux-gnu
+          BUILD_PROFILE: release
+        run: |
+          chmod +x scripts/package_steam_deck.sh
+          ./scripts/package_steam_deck.sh
+          ls -lah dist
+
+      - name: Upload Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pw-ac3-live-steamdeck-${{ github.sha }}
+          path: dist/pw-ac3-live-steamdeck-*.tar.gz
+          if-no-files-found: error
