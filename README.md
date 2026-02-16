@@ -35,11 +35,24 @@ cargo run --release -- --target 42
 
 # Write IEC61937 bytes to stdout (no PipeWire playback stream)
 cargo run --release -- --stdout > output.spdif
+
+# Lower latency profile (good starting point)
+cargo run --release -- --target <your-hdmi-node> \
+  --buffer-size 960 \
+  --latency 32/48000 \
+  --ffmpeg-thread-queue-size 16 \
+  --ffmpeg-chunk-frames 128
 ```
 
 `--target` accepts either a node name or a numeric object ID. Numeric values are applied to both the stream connect target and `target.object` properties. Name values are applied as `target.object`.
 
 `--stdout` mode drains buffered encoder output and exits cleanly on shutdown.
+
+Latency-related knobs:
+- `--buffer-size`: app ring buffer size in frames (default `4800`).
+- `--latency`: PipeWire node latency target (default `64/48000`).
+- `--ffmpeg-thread-queue-size`: FFmpeg input queue depth (default `128`).
+- `--ffmpeg-chunk-frames`: frame batch size written to FFmpeg (default `128`).
 
 ## Fresh Start (Recommended)
 Use this section if you want to reset your setup and start from zero.
@@ -110,7 +123,10 @@ pw-cli e <DEVICE_ID> Route | rg "iec958Codecs|AudioIEC958Codec"
 
 ### 6) Start `pw-ac3-live`
 ```bash
-RUST_LOG=info cargo run --release -- --target alsa_output.pci-0000_00_1f.3.hdmi-stereo
+RUST_LOG=info cargo run --release -- --target alsa_output.pci-0000_00_1f.3.hdmi-stereo \
+  --buffer-size 960 \
+  --latency 32/48000 \
+  --ffmpeg-thread-queue-size 16
 ```
 
 ### 7) Route app audio into `pw-ac3-live-input`
@@ -193,6 +209,21 @@ pw-link -l
 Increase ring buffer size:
 ```bash
 cargo run --release -- --target <your-hdmi-stereo-node> --buffer-size 9600
+```
+
+If latency is too high, reduce in this order until stable:
+```bash
+# 1) lower buffer size
+--buffer-size 960
+# 2) lower PipeWire latency target
+--latency 32/48000
+# 3) keep FFmpeg queue small
+--ffmpeg-thread-queue-size 16
+```
+
+If you get silence after aggressive tuning, move back to stable values first:
+```bash
+--buffer-size 4800 --latency 64/48000 --ffmpeg-thread-queue-size 128
 ```
 
 ### Sound is stereo only / All channels come from Front Speakers

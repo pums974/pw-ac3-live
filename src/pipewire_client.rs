@@ -21,6 +21,19 @@ const SAMPLE_RATE_HZ: u32 = 48_000;
 const STDOUT_READ_BUFFER_SIZE: usize = 4096;
 const OUTPUT_FRAME_BYTES: usize = OUTPUT_CHANNELS * size_of::<i16>();
 
+#[derive(Debug, Clone)]
+pub struct PipewireConfig {
+    pub node_latency: String,
+}
+
+impl Default for PipewireConfig {
+    fn default() -> Self {
+        Self {
+            node_latency: "64/48000".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlaybackTarget {
     connect_target_id: Option<u32>,
@@ -45,7 +58,6 @@ fn resolve_playback_target(target_node: Option<&str>) -> PlaybackTarget {
 
 fn build_playback_properties(target: &PlaybackTarget) -> pw::properties::Properties {
     let mut playback_props = properties! {
-        *pw::keys::MEDIA_CLASS => "Audio/Source",
         *pw::keys::NODE_NAME => "pw-ac3-live-output",
         *pw::keys::NODE_DESCRIPTION => "AC-3 Live Output",
         *pw::keys::APP_NAME => "pw-ac3-live",
@@ -240,12 +252,35 @@ fn build_audio_raw_format_param(format: AudioFormat, channels: u32) -> Result<Ve
 /// Runs the main PipeWire event loop.
 pub fn run_pipewire_loop(
     input_producer: Producer<f32>,
-    mut output_consumer: Consumer<u8>,
+    output_consumer: Consumer<u8>,
     target_node: Option<String>,
     use_stdout: bool,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
+    run_pipewire_loop_with_config(
+        input_producer,
+        output_consumer,
+        target_node,
+        use_stdout,
+        running,
+        PipewireConfig::default(),
+    )
+}
+
+pub fn run_pipewire_loop_with_config(
+    input_producer: Producer<f32>,
+    mut output_consumer: Consumer<u8>,
+    target_node: Option<String>,
+    use_stdout: bool,
+    running: Arc<AtomicBool>,
+    config: PipewireConfig,
+) -> Result<()> {
     info!("Initializing PipeWire client...");
+    let node_latency = if config.node_latency.trim().is_empty() {
+        "64/48000"
+    } else {
+        config.node_latency.as_str()
+    };
 
     pw::init();
 
@@ -266,6 +301,7 @@ pub fn run_pipewire_loop(
         "audio.position" => "FL,FR,FC,LFE,SL,SR",
         "audio.rate" => SAMPLE_RATE,
         "audio.format" => "F32LE",
+        "node.latency" => node_latency,
     };
 
     let data = Arc::new(Mutex::new(input_producer));
@@ -476,7 +512,8 @@ pub fn run_pipewire_loop(
         // Create Playback Stream (Output to HDMI/Sink)
 
         // Strategy: Use properties for Audio/Source
-        let playback_props = build_playback_properties(&playback_target);
+        let mut playback_props = build_playback_properties(&playback_target);
+        playback_props.insert("node.latency", node_latency);
 
         let output_data = Arc::new(Mutex::new(output_consumer));
 
@@ -515,38 +552,36 @@ pub fn run_pipewire_loop(
                             return;
                         }
 
-                        let capacity = {
+                        let to_write = {
                             let Some(raw_data) = datas[0].data() else {
                                 return;
                             };
-                            let capacity = raw_data.len();
-                            if capacity == 0 {
+                            let max_writable = raw_data.len();
+                            if max_writable == 0 {
                                 return;
                             }
 
-                            raw_data.fill(0);
-
+                            let mut bytes_to_copy = 0usize;
                             if let Ok(mut consumer) = output_data.try_lock() {
                                 let available = consumer.slots();
-                                let to_write = (available.min(capacity) / OUTPUT_FRAME_BYTES)
+                                bytes_to_copy = (available.min(max_writable) / OUTPUT_FRAME_BYTES)
                                     * OUTPUT_FRAME_BYTES;
 
-                                if to_write > 0 {
-                                    if let Ok(chunk) = consumer.read_chunk(to_write) {
+                                if bytes_to_copy > 0 {
+                                    if let Ok(chunk) = consumer.read_chunk(bytes_to_copy) {
                                         for (i, byte) in chunk.into_iter().enumerate() {
                                             raw_data[i] = byte;
                                         }
                                     }
                                 }
                             }
-
-                            capacity
+                            bytes_to_copy
                         };
 
                         let chunk = datas[0].chunk_mut();
                         *chunk.offset_mut() = 0;
                         *chunk.stride_mut() = OUTPUT_FRAME_BYTES as i32;
-                        *chunk.size_mut() = capacity as u32;
+                        *chunk.size_mut() = to_write as u32;
                     }
                 },
             )

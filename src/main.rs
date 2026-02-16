@@ -28,6 +28,18 @@ struct Args {
     /// Default is approx 100ms at 48kHz
     #[arg(short, long, default_value_t = 4800)]
     buffer_size: usize,
+
+    /// Requested PipeWire node latency (e.g. 64/48000, 32/48000, 16/48000)
+    #[arg(long, default_value = "64/48000")]
+    latency: String,
+
+    /// FFmpeg input thread queue size
+    #[arg(long, default_value_t = 128)]
+    ffmpeg_thread_queue_size: usize,
+
+    /// Number of interleaved frames pushed to FFmpeg per write
+    #[arg(long, default_value_t = 128)]
+    ffmpeg_chunk_frames: usize,
 }
 
 fn main() -> Result<()> {
@@ -37,6 +49,11 @@ fn main() -> Result<()> {
     info!("Starting pw-ac3-live...");
     info!("Target Sink: {:?}", args.target);
     info!("Buffer Size: {}", args.buffer_size);
+    info!("PipeWire node latency: {}", args.latency);
+    info!(
+        "FFmpeg queue/chunk: {} / {}",
+        args.ffmpeg_thread_queue_size, args.ffmpeg_chunk_frames
+    );
 
     // 1. Setup RingBuffers
     // SPSC (Single Producer Single Consumer) lock-free queues.
@@ -52,7 +69,7 @@ fn main() -> Result<()> {
     // Output: Encoder -> Playback (u8 bytes for IEC61937 stream)
     // AC-3 frames are small, but IEC61937 frames match the PCM rate.
     // Allocating enough for output buffering.
-    let (output_producer, output_consumer) = RingBuffer::<u8>::new(capacity_samples * 4); // ample space
+    let (output_producer, output_consumer) = RingBuffer::<u8>::new(args.buffer_size * 4);
 
     // 2. Setup Shutdown Signal
     let running = Arc::new(AtomicBool::new(true));
@@ -65,18 +82,31 @@ fn main() -> Result<()> {
 
     // 3. Spawn Encoder Thread
     let encoder_running = running.clone();
+    let encoder_config = encoder::EncoderConfig {
+        ffmpeg_thread_queue_size: args.ffmpeg_thread_queue_size,
+        feeder_chunk_frames: args.ffmpeg_chunk_frames,
+    };
     let encoder_handle = thread::spawn(move || {
-        encoder::run_encoder_loop(input_consumer, output_producer, encoder_running)
+        encoder::run_encoder_loop_with_config(
+            input_consumer,
+            output_producer,
+            encoder_running,
+            encoder_config,
+        )
     });
 
     // 4. Start PipeWire Client (Main Thread or blocked)
     // logic to connect to PipeWire...
-    let pipewire_result = pipewire_client::run_pipewire_loop(
+    let pipewire_config = pipewire_client::PipewireConfig {
+        node_latency: args.latency,
+    };
+    let pipewire_result = pipewire_client::run_pipewire_loop_with_config(
         input_producer,
         output_consumer,
         args.target,
         args.stdout,
         running.clone(),
+        pipewire_config,
     );
 
     // Always request shutdown and join the encoder thread, even if PipeWire init failed.

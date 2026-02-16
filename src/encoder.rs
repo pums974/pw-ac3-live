@@ -8,6 +8,21 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone)]
+pub struct EncoderConfig {
+    pub ffmpeg_thread_queue_size: usize,
+    pub feeder_chunk_frames: usize,
+}
+
+impl Default for EncoderConfig {
+    fn default() -> Self {
+        Self {
+            ffmpeg_thread_queue_size: 128,
+            feeder_chunk_frames: 128,
+        }
+    }
+}
+
 /// Manages the FFmpeg subprocess for encoding.
 ///
 /// Spawns `ffmpeg`, creates one thread to feed it audio from `input_consumer`,
@@ -19,11 +34,24 @@ use std::time::{Duration, Instant};
 /// * `output` - Producer for encoded IEC61937 bytes.
 /// * `running` - Atomic flag.
 pub fn run_encoder_loop(
+    input: Consumer<f32>,
+    output: Producer<u8>,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    run_encoder_loop_with_config(input, output, running, EncoderConfig::default())
+}
+
+pub fn run_encoder_loop_with_config(
     mut input: Consumer<f32>,
     mut output: Producer<u8>,
     running: Arc<AtomicBool>,
+    config: EncoderConfig,
 ) -> Result<()> {
     info!("Starting FFmpeg subprocess...");
+
+    let ffmpeg_thread_queue_size = config.ffmpeg_thread_queue_size.max(1);
+    let feeder_chunk_frames = config.feeder_chunk_frames.max(1);
+    let ffmpeg_thread_queue_size_arg = ffmpeg_thread_queue_size.to_string();
 
     // Command:
     // ffmpeg -y -f f32le -ar 48000 -ac 6 -i pipe:0 -c:ac3 -b:a 640k -f spdif pipe:1
@@ -33,10 +61,35 @@ pub fn run_encoder_loop(
 
     let mut child = Command::new("ffmpeg")
         .args([
-            "-y", "-f", "f32le", "-ar", "48000", "-ac", "6", "-i",
+            "-y",
+            "-f",
+            "f32le",
+            "-ar",
+            "48000",
+            "-ac",
+            "6",
+            "-i",
             "pipe:0", // Read from stdin
-            "-c:a", "ac3", "-b:a", "640k", // Max bitrate for AC-3
-            "-f", "spdif",  // Encapsulate as IEC 61937
+            "-c:a",
+            "ac3",
+            "-b:a",
+            "640k", // Max bitrate for AC-3
+            "-f",
+            "spdif", // Encapsulate as IEC 61937
+            "-fflags",
+            "+nobuffer", // Reduce latency
+            "-flags",
+            "+low_delay", // Reduce latency
+            "-probesize",
+            "32", // Minimum probe size
+            "-analyzeduration",
+            "0", // No analysis duration
+            "-flush_packets",
+            "1", // Flush packets immediately
+            "-avioflags",
+            "direct", // Force direct IO
+            "-thread_queue_size",
+            ffmpeg_thread_queue_size_arg.as_str(),
             "pipe:1", // Write to stdout
         ])
         .stdin(Stdio::piped())
@@ -58,13 +111,13 @@ pub fn run_encoder_loop(
 
     // Spawn Feeder Thread (RingBuffer -> Stdin)
     let feeder_handle = thread::spawn(move || -> Result<()> {
-        let mut byte_buffer = Vec::with_capacity(1024 * 6 * 4);
+        let mut byte_buffer = Vec::with_capacity(feeder_chunk_frames * 6 * 4);
 
         while running_feeder.load(Ordering::Relaxed) {
             // Read from RingBuffer
             // We want to move data as fast as possible.
             if input.slots() > 0 {
-                if let Ok(chunk) = input.read_chunk(input.slots().min(1024 * 6)) {
+                if let Ok(chunk) = input.read_chunk(input.slots().min(feeder_chunk_frames * 6)) {
                     // Copy to local buffer
                     byte_buffer.clear();
                     for sample in chunk {
@@ -76,6 +129,13 @@ pub fn run_encoder_loop(
                     if let Err(e) = stdin.write_all(&byte_buffer) {
                         if running_feeder.load(Ordering::Relaxed) {
                             return Err(anyhow!(e).context("Failed to write to ffmpeg stdin"));
+                        }
+                        break;
+                    }
+                    // Force flush to prevent buffering in the pipe
+                    if let Err(e) = stdin.flush() {
+                        if running_feeder.load(Ordering::Relaxed) {
+                            return Err(anyhow!(e).context("Failed to flush ffmpeg stdin"));
                         }
                         break;
                     }

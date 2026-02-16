@@ -3,6 +3,53 @@ set -e
 
 # Goal: Setup HDMI for AC3 passthrough and launch the encoder
 
+LOW_LATENCY_BUFFER_SIZE="${PW_AC3_BUFFER_SIZE:-4800}"
+LOW_LATENCY_NODE_LATENCY="${PW_AC3_NODE_LATENCY:-64/48000}"
+LOW_LATENCY_THREAD_QUEUE="${PW_AC3_FFMPEG_THREAD_QUEUE_SIZE:-128}"
+LOW_LATENCY_CHUNK_FRAMES="${PW_AC3_FFMPEG_CHUNK_FRAMES:-128}"
+
+find_pw_ac3_live_sink_input_id() {
+    pactl list sink-inputs | awk '
+        /^Sink Input #/ { id = substr($3, 2); next }
+        /^[[:space:]]*application.name = "pw-ac3-live"/ { print id; exit }
+        /^[[:space:]]*Application Name: pw-ac3-live$/ { print id; exit }
+    '
+}
+
+configure_hdmi_passthrough() {
+    local sink_index="$1"
+
+    echo "Configuring sink formats and volume..."
+    if ! pactl set-sink-formats "$sink_index" 'ac3-iec61937, format.rate = "[ 48000 ]"'; then
+        echo "Warning: Exact AC3 format string failed, retrying generic ac3-iec61937..."
+        pactl set-sink-formats "$sink_index" "ac3-iec61937" || echo "Warning: Failed to set AC3 sink formats."
+    fi
+
+    pactl set-sink-volume "$sink_index" 100%
+    pactl set-sink-mute "$sink_index" 0
+}
+
+normalize_pw_ac3_live_levels() {
+    echo "Normalizing pw-ac3-live node/stream volumes..."
+
+    pactl set-sink-volume "pw-ac3-live-input" 100% || true
+    pactl set-sink-mute "pw-ac3-live-input" 0 || true
+
+    local stream_id=""
+    for _ in $(seq 1 20); do
+        stream_id=$(find_pw_ac3_live_sink_input_id)
+        if [ -n "$stream_id" ]; then
+            pactl set-sink-input-volume "$stream_id" 100% || true
+            pactl set-sink-input-mute "$stream_id" 0 || true
+            echo "Set pw-ac3-live playback stream volume to 100% (sink-input #$stream_id)."
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    echo "Warning: Could not find pw-ac3-live playback sink-input; leaving stream volume unchanged."
+}
+
 # 0. Cleanup previous runs
 echo "Stopping any existing instances..."
 pkill -INT -f "pw-ac3-live" || true
@@ -69,13 +116,7 @@ fi
 echo "Selected Sink: $SINK_NAME (Index: $SINK_INDEX)"
 
 # 4. Configure Sink Formats (AC3 Passthrough) & Volume
-echo "Configuring sink formats and volume..."
-# Use index for pactl just to be safe from parsing issues with names containing dots/dashes?
-# pactl documentation says NAME or ID.
-# Let's try ID.
-pactl set-sink-formats "$SINK_INDEX" "ac3-iec61937"
-pactl set-sink-volume "$SINK_INDEX" 100%
-pactl set-sink-mute "$SINK_INDEX" 0
+configure_hdmi_passthrough "$SINK_INDEX"
 
 # 5. Launch Application
 echo "Launching pw-ac3-live..."
@@ -85,7 +126,11 @@ echo "Launching pw-ac3-live..."
 # If we run from terminal script, we probably want to see logs.
 # Let's run it in foreground? No, the prompt implied we might want to do post-setup.
 # So run in background, capture PID.
-RUST_LOG=info cargo run --release -- --target "$SINK_NAME" &
+RUST_LOG=info cargo run --release -- --target "$SINK_NAME" \
+    --buffer-size "$LOW_LATENCY_BUFFER_SIZE" \
+    --latency "$LOW_LATENCY_NODE_LATENCY" \
+    --ffmpeg-thread-queue-size "$LOW_LATENCY_THREAD_QUEUE" \
+    --ffmpeg-chunk-frames "$LOW_LATENCY_CHUNK_FRAMES" &
 APP_PID=$!
 echo "App launched with PID $APP_PID"
 
@@ -94,7 +139,7 @@ echo "Waiting for pw-ac3-live-input node to appear..."
 MAX_RETRIES=20
 FOUND=0
 for i in $(seq 1 $MAX_RETRIES); do
-    if pw-link -o | grep -q "pw-ac3-live-input"; then
+    if pw-link -i | grep -q "pw-ac3-live-input"; then
         FOUND=1
         break
     fi
@@ -124,9 +169,12 @@ pactl set-default-sink "pw-ac3-live-input" || echo "Warning: Could not set defau
 echo "Ensuring encoder output is linked to HDMI..."
 ./scripts/connect.sh "$SINK_NAME"
 
+# 9. Enforce bitstream-safe runtime levels after graph creation
+normalize_pw_ac3_live_levels
+
 echo "========================================"
 echo "LAUNCH SUCCESSFUL"
-echo "ptr-ac3-live is running. Press SINK VOLUME warning: Ensure your physical receiver volume is strictly controlled!"
+echo "pw-ac3-live is running. Press SINK VOLUME warning: Ensure your physical receiver volume is strictly controlled!"
 echo "Main logs are above. Press Ctrl+C to stop everything."
 echo "========================================"
 
