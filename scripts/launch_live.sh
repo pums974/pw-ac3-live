@@ -12,6 +12,7 @@ LOW_LATENCY_NODE_LATENCY="${PW_AC3_NODE_LATENCY:-64/48000}"
 LOW_LATENCY_THREAD_QUEUE="${PW_AC3_FFMPEG_THREAD_QUEUE_SIZE:-16}"
 LOW_LATENCY_CHUNK_FRAMES="${PW_AC3_FFMPEG_CHUNK_FRAMES:-64}"
 ENABLE_LATENCY_PROFILE="${PW_AC3_PROFILE_LATENCY:-0}"
+TARGET_SINK_OVERRIDE="${PW_AC3_TARGET_SINK:-}"
 APP_BIN="${ROOT_DIR}/bin/pw-ac3-live"
 DEV_BIN="${ROOT_DIR}/target/release/pw-ac3-live"
 USE_PACKAGED_BINARY=0
@@ -58,70 +59,121 @@ normalize_pw_ac3_live_levels() {
     echo "Warning: Could not find pw-ac3-live playback sink-input; leaving stream volume unchanged."
 }
 
+find_best_hdmi_sink_line() {
+    pactl list sinks short | awk '
+        BEGIN { best_score = -100000 }
+        $2 ~ /hdmi/ {
+            name = $2
+            score = 0
+
+            if (name ~ /^alsa_output\./) score += 100
+            if (name ~ /pci-/) score += 20
+            if (name ~ /hdmi-stereo/) score += 10
+            if ($NF == "RUNNING") score += 5
+
+            if (name ~ /^alsa_loopback_device\./) score -= 300
+            if (name ~ /loopback/) score -= 300
+            if (name ~ /pw-ac3-live/) score -= 300
+            if (name ~ /monitor/) score -= 150
+
+            if (score > best_score) {
+                best_score = score
+                best_line = $0
+            }
+        }
+        END {
+            if (best_line != "") {
+                print best_line
+            }
+        }
+    '
+}
+
 # 0. Cleanup previous runs
 echo "Stopping any existing instances..."
 pkill -INT -f "pw-ac3-live" || true
 sleep 1
-
-# 1. Detect HDMI Card
-echo "Detecting HDMI card..."
-# We first find the card name to set profiles.
-# Example: alsa_card.pci-0000_00_1f.3
-CARD_NAME=$(pactl list cards short | grep "pci" | cut -f2 | head -n1)
-
-if [ -z "$CARD_NAME" ]; then
-    echo "Error: Could not automatically detect a PCI sound card."
-    echo "Cards found:"
-    pactl list cards short
-    exit 1
-fi
-echo "Selected Card: $CARD_NAME"
-
-# Extract the device identifier (e.g., pci-0000_00_1f.3) from the card name.
-# This part is usually shared between card and sink names.
-# Pattern: alsa_card.pci-XXXX... -> pci-XXXX...
-# We just strip 'alsa_card.' prefix if present.
-DEVICE_ID=$(echo "$CARD_NAME" | sed 's/^alsa_card\.//')
-echo "Device ID: $DEVICE_ID"
-
-# 2. Set Profile to HDMI Stereo
-echo "Setting card profile..."
-# Try to find the profile name from `pactl list cards`
-# We look for a profile that is "output:hdmi-stereo" possibly with input tacked on.
-# The user's system likely uses "output:hdmi-stereo+input:analog-stereo" or similar.
-# Let's find any profile containing "output:hdmi-stereo" and use the first one.
-# sed logic: range from Name: CARD to Active Profile, then find line with output:hdmi-stereo
-PROFILE_NAME=$(pactl list cards | sed -n "/Name: $CARD_NAME/,/Active Profile/p" | grep "output:hdmi-stereo" | head -n1 | awk '{print $1}' | sed 's/:$//')
-
-# If detection fails, we shouldn't just guess "output:hdmi-stereo" because it might need "+input:..."
-# But if it's empty, we have to guess something or fail.
-if [ -z "$PROFILE_NAME" ]; then
-    echo "Warning: Could not find exact 'output:hdmi-stereo' profile."
-    # A common fallback
-    PROFILE_NAME="output:hdmi-stereo"
-fi
-
-echo "Using Profile: $PROFILE_NAME"
-# Attempt to set it. capturing stderr to void if it fails? No, we want to see error.
-if ! pactl set-card-profile "$CARD_NAME" "$PROFILE_NAME"; then
-    echo "Failed to set profile '$PROFILE_NAME'. Attempting to append '+input:analog-stereo'..."
-    pactl set-card-profile "$CARD_NAME" "${PROFILE_NAME}+input:analog-stereo" || echo "Warning: Failed to set profile. Proceeding anyway."
-fi
-
-# 3. Find HDMI Sink Name
+# 1. Detect HDMI sink (prefer physical ALSA output; allow manual override)
 echo "Finding HDMI sink..."
-# Now we search for a sink that contains the DEVICE_ID and "hdmi-stereo".
-# Get the Name
-SINK_NAME=$(pactl list sinks short | grep "$DEVICE_ID" | grep "hdmi-stereo" | cut -f2 | head -n1)
-# Get the Index (1st column)
-SINK_INDEX=$(pactl list sinks short | grep "$DEVICE_ID" | grep "hdmi-stereo" | cut -f1 | head -n1)
-
-if [ -z "$SINK_NAME" ]; then
-    echo "Error: Could not find HDMI stereo sink matching '$DEVICE_ID' and 'hdmi-stereo'."
-    pactl list sinks short
-    exit 1
+if [ -n "$TARGET_SINK_OVERRIDE" ]; then
+  echo "Using PW_AC3_TARGET_SINK override: $TARGET_SINK_OVERRIDE"
+  HDMI_LINE=$(pactl list sinks short | awk -v sink="$TARGET_SINK_OVERRIDE" '$2==sink {print; exit}')
+else
+  HDMI_LINE=$(find_best_hdmi_sink_line)
 fi
+
+if [ -z "$HDMI_LINE" ]; then
+  echo "Error: No HDMI sink found."
+  pactl list sinks short
+  exit 1
+fi
+
+SINK_INDEX=$(echo "$HDMI_LINE" | awk '{print $1}')
+SINK_NAME=$(echo "$HDMI_LINE"  | awk '{print $2}')
 echo "Selected Sink: $SINK_NAME (Index: $SINK_INDEX)"
+
+if echo "$SINK_NAME" | grep -q "loopback"; then
+  echo "Warning: Selected sink appears to be loopback-based. Passthrough may be silent."
+  echo "Hint: export PW_AC3_TARGET_SINK=<physical alsa_output...hdmi-stereo sink>"
+fi
+
+# 2. Get the card index backing that sink, then card name
+CARD_INDEX=$(
+  pactl list sinks | awk -v s="$SINK_NAME" '
+    $1=="Name:" && $2==s {found=1; next}
+    found && $1=="Card:" {print $2; exit}
+    found && $1=="Name:" && $2!=s {exit}
+  '
+)
+
+if [ -z "$CARD_INDEX" ]; then
+  DERIVED_CARD_NAME=$(echo "$SINK_NAME" | sed 's/^alsa_output\./alsa_card./; s/\.hdmi.*$//')
+  if [ -n "$DERIVED_CARD_NAME" ]; then
+    CARD_INDEX=$(pactl list cards short | awk -v n="$DERIVED_CARD_NAME" '$2==n {print $1; exit}')
+    if [ -n "$CARD_INDEX" ]; then
+      echo "Derived card from sink name: $DERIVED_CARD_NAME (Index: $CARD_INDEX)"
+    fi
+  fi
+fi
+
+if [ -z "$CARD_INDEX" ]; then
+  echo "Warning: Could not determine card index for sink; skipping profile set."
+  CARD_NAME=""
+else
+  CARD_NAME=$(pactl list cards short | awk -v id="$CARD_INDEX" '$1==id {print $2; exit}')
+  echo "Selected Card: $CARD_NAME (Index: $CARD_INDEX)"
+fi
+
+# 3. Try to set a matching HDMI profile (optional; do not hard-fail)
+if [ -n "$CARD_NAME" ]; then
+  # Extract device.profile.name from the sink, e.g. "hdmi-stereo-extra2"
+  PROFILE_SUFFIX=$(
+    pactl list sinks | awk -v s="$SINK_NAME" '
+      $1=="Name:" && $2==s {found=1}
+      found && $0 ~ /device\.profile\.name/ {
+        # last field is usually "hdmi-stereo-extraX" in quotes
+        gsub(/"/,"",$NF); print $NF; exit
+      }
+    '
+  )
+
+  if [ -n "$PROFILE_SUFFIX" ]; then
+    # Find an exact profile token on that card containing output:<suffix>
+    PROFILE_NAME=$(
+      pactl list cards | sed -n "/Name: $CARD_NAME/,/Active Profile/p" \
+        | awk -v suf="$PROFILE_SUFFIX" '$1 ~ ("output:"suf) {gsub(/:$/,"",$1); print $1; exit}'
+    )
+
+    # Fallback
+    [ -z "$PROFILE_NAME" ] && PROFILE_NAME="output:$PROFILE_SUFFIX"
+
+    echo "Setting card profile: $PROFILE_NAME"
+    pactl set-card-profile "$CARD_NAME" "$PROFILE_NAME" || \
+      echo "Warning: Failed to set card profile; continuing."
+  else
+    echo "Warning: Could not read device.profile.name; skipping profile set."
+  fi
+fi
 
 # 4. Configure Sink Formats (AC3 Passthrough) & Volume
 configure_hdmi_passthrough "$SINK_INDEX"
@@ -190,10 +242,8 @@ echo "App launched with PID $APP_PID"
 # 6. Wait for Nodes
 echo "Waiting for pw-ac3-live-input node to appear..."
 MAX_RETRIES=20
-FOUND=0
-for i in $(seq 1 $MAX_RETRIES); do
+for _ in $(seq 1 "$MAX_RETRIES"); do
     if pw-link -i | grep -q "pw-ac3-live-input"; then
-        FOUND=1
         break
     fi
     sleep 0.5
@@ -208,15 +258,24 @@ fi
 
 # 7. Set Default Sink
 echo "Setting 'AC-3 Encoder Input' as default sink..."
-# We need the ID for wpctl set-default.
-# `pw-cli info match node.name=pw-ac3-live-input` or parsing `wpctl status`
-# Simplest: use `pactl get-sink-volume` logic? No, `wpctl` is better for wireplumber defaults.
-# Let's find the ID.
-ENCODER_ID=$(wpctl status | grep "AC-3 Encoder Input" | grep -o "[0-9]\+" | head -n1) # This grep is risky on ID column
-# Better way using pw-dump or pactl?
-# `pactl get-default-sink` ?
-# We can set default by NAME using pactl!
 pactl set-default-sink "pw-ac3-live-input" || echo "Warning: Could not set default sink via pactl."
+if command -v wpctl >/dev/null 2>&1; then
+    ENCODER_ID=$(wpctl status | awk '
+      /AC-3 Encoder Input/ {
+        if (match($0, /[0-9]+/)) {
+          print substr($0, RSTART, RLENGTH)
+          exit
+        }
+      }
+    ')
+    if [ -n "$ENCODER_ID" ]; then
+        wpctl set-default "$ENCODER_ID" || echo "Warning: Could not set default sink via wpctl."
+    else
+        echo "Warning: Could not find AC-3 Encoder Input ID in wpctl status; skipping wpctl default set."
+    fi
+else
+    echo "Warning: wpctl not found; skipping wpctl default set."
+fi
 
 # 8. Ensure Link (Output -> HDMI)
 echo "Ensuring encoder output is linked to HDMI..."

@@ -66,6 +66,9 @@ PW_AC3_PROFILE_LATENCY=1 ./scripts/launch_live.sh
 
 # Optional: lower output ring independently (frames)
 PW_AC3_OUTPUT_BUFFER_SIZE=960 ./scripts/launch_live.sh
+
+# Optional: force a specific physical HDMI sink node
+PW_AC3_TARGET_SINK=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 ./scripts/launch_live.sh
 ```
 
 ## Fresh Start (Recommended)
@@ -203,10 +206,17 @@ Check in order:
 1. Encoder input is not being fed by apps.
 2. `pw-ac3-live-output` is not linked to HDMI sink (Auto-link failed).
 3. Other apps are hogging the HDMI sink (Exclusive access required).
-4. Volumes/mute in `wpctl status`.
+4. Launcher selected a loopback sink (`alsa_loopback_device...`) instead of a physical `alsa_output...hdmi-stereo` sink.
+5. Volumes/mute in `wpctl status`.
 
 Fix:
 ```bash
+# Inspect sink candidates
+pactl list sinks short | rg hdmi
+
+# Force a physical HDMI sink if auto-detection picked loopback
+PW_AC3_TARGET_SINK=<alsa_output...hdmi-stereo sink> ./scripts/launch_live.sh
+
 # Force link
 ./scripts/connect.sh <hdmi-sink-name>
 # Unlink others (example)
