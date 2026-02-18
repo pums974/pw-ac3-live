@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+
 const INPUT_CHANNELS: usize = 6;
 const SAMPLE_RATE_HZ: f64 = 48_000.0;
 const OUTPUT_FRAME_BYTES: f64 = 4.0;
@@ -16,6 +19,34 @@ const OUTPUT_FRAME_BYTES_U8: usize = 4;
 const MAX_STDOUT_READ_BUFFER_SIZE: usize = 1024;
 const MIN_STDOUT_READ_BUFFER_SIZE: usize = 512;
 const PROFILE_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+/// Minimum pipe buffer size (4KB = one page, the kernel minimum).
+const TARGET_PIPE_SIZE: i32 = 4096;
+
+/// Shrink a pipe's kernel buffer to `TARGET_PIPE_SIZE` bytes.
+/// Returns `Ok(actual_size)` on success. Failures are non-fatal.
+#[cfg(target_os = "linux")]
+fn shrink_pipe_buffer(fd: std::os::unix::io::RawFd, label: &str) {
+    const F_SETPIPE_SZ: libc::c_int = 1031;
+    const F_GETPIPE_SZ: libc::c_int = 1032;
+
+    let old_size = unsafe { libc::fcntl(fd, F_GETPIPE_SZ) };
+    let ret = unsafe { libc::fcntl(fd, F_SETPIPE_SZ, TARGET_PIPE_SIZE) };
+    if ret < 0 {
+        warn!(
+            "Could not shrink {} pipe (fd={}) from {} to {}: errno={}",
+            label,
+            fd,
+            old_size,
+            TARGET_PIPE_SIZE,
+            std::io::Error::last_os_error()
+        );
+    } else {
+        info!(
+            "Shrunk {} pipe (fd={}) from {} to {} bytes",
+            label, fd, old_size, ret
+        );
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
@@ -183,44 +214,53 @@ pub fn run_encoder_loop_with_config(
     // Usually spdif output is S16LE (2 channels) carrying the payload.
     // The byte stream from stdout will be S16LE PCM frames essentially.
 
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-f",
-            "f32le",
-            "-ar",
-            "48000",
-            "-ac",
-            "6",
-            "-i",
-            "pipe:0", // Read from stdin
-            "-c:a",
-            "ac3",
-            "-b:a",
-            "640k", // Max bitrate for AC-3
-            "-f",
-            "spdif", // Encapsulate as IEC 61937
-            "-fflags",
-            "+nobuffer", // Reduce latency
-            "-flags",
-            "+low_delay", // Reduce latency
-            "-probesize",
-            "32", // Minimum probe size
-            "-analyzeduration",
-            "0", // No analysis duration
-            "-flush_packets",
-            "1", // Flush packets immediately
-            "-avioflags",
-            "direct", // Force direct IO
-            "-thread_queue_size",
-            ffmpeg_thread_queue_size_arg.as_str(),
-            "pipe:1", // Write to stdout
-        ])
+    let mut command = Command::new("ffmpeg");
+    
+    // Global / Demuxer Flags MUST come before input
+    command.args([
+        "-y",
+        "-probesize", "32", 
+        "-analyzeduration", "0",
+        "-fflags", "+nobuffer",
+        "-flags", "+low_delay",
+        // Input Format
+        "-f", "f32le",
+        "-ar", "48000",
+        "-ac", "6",
+        "-thread_queue_size", ffmpeg_thread_queue_size_arg.as_str(),
+        "-i", "pipe:0", // Input
+    ]);
+
+    if std::env::var("PW_AC3_TEST_FFMPEG_PCM").unwrap_or_else(|_| "0".to_string()) == "1" {
+        info!("TEST MODE: Using FFmpeg PCM S16LE passthrough (No AC-3 encoding)");
+        command.args([
+            "-c:a", "pcm_s16le",
+            "-f", "s16le",
+        ]);
+    } else {
+        command.args([
+            "-c:a", "ac3",
+            "-b:a", "640k", 
+            "-bufsize", "0", 
+            "-f", "spdif", 
+        ]);
+    }
+
+    // Muxer / Output flags
+    command.args([
+        "-flush_packets", "1",
+        "-muxdelay", "0",
+        "-muxpreload", "0",
+        "-avioflags", "direct",
+        "pipe:1", // Output
+    ]);
+    
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()) // Let ffmpeg logs show up in stderr
-        .spawn()
-        .context("Failed to spawn ffmpeg")?;
+        .stderr(Stdio::inherit()); // Let ffmpeg logs show up in stderr
+
+    let mut child = command.spawn().context("Failed to spawn ffmpeg")?;
 
     let mut stdin = child
         .stdin
@@ -230,6 +270,14 @@ pub fn run_encoder_loop_with_config(
         .stdout
         .take()
         .ok_or_else(|| anyhow!("Failed to open stdout"))?;
+
+    // Shrink the kernel pipe buffers between us and FFmpeg to reduce latency.
+    // Default is 64KB per pipe; we shrink to 4KB (one page).
+    #[cfg(target_os = "linux")]
+    {
+        shrink_pipe_buffer(stdin.as_raw_fd(), "ffmpeg-stdin");
+        shrink_pipe_buffer(stdout.as_raw_fd(), "ffmpeg-stdout");
+    }
 
     let running_feeder = running.clone();
     let profiler_feeder = profiler.clone();
@@ -455,5 +503,90 @@ pub fn run_encoder_loop_with_config(
         }
     }
 
+    Ok(())
+}
+
+/// Runs a passthrough loop that copies audio from input to output without encoding.
+/// Converts 6-channel F32LE input to 2-channel S16LE output (Stereo downmix/truncation).
+pub fn run_passthrough_loop(
+    mut input: Consumer<f32>,
+    mut output: Producer<u8>,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    info!("Starting Passthrough Loop (PCM Direct Copy: 6ch Float -> 2ch S16LE)...");
+
+    const CHUNK_FRAMES: usize = 128;
+    // Buffer for 128 frames * 6 channels = 768 floats
+    let mut input_buf = [0.0f32; 6 * CHUNK_FRAMES];
+    // Buffer for 128 frames * 2 channels * 2 bytes = 512 bytes
+    let mut output_buf = [0u8; 4 * CHUNK_FRAMES];
+    let mut debug_counter = 0;
+
+    while running.load(Ordering::Relaxed) {
+        let in_slots = input.slots();
+        let out_slots = output.slots();
+        
+        let frames_in = in_slots / 6;
+        let frames_out = out_slots / 4;
+        let count = frames_in.min(frames_out).min(CHUNK_FRAMES);
+
+        if count > 0 {
+            let samples_in = count * 6;
+            
+            // Read floats manually
+            let mut samples_read = 0;
+            for i in 0..samples_in {
+                match input.pop() {
+                    Ok(sample) => {
+                        input_buf[i] = sample;
+                        samples_read += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            
+            let frames_read = samples_read / 6;
+            if frames_read > 0 {
+                // Debug logging every ~1 second (approx 375 chunks @ 128 frames, 48kHz)
+                debug_counter += 1;
+                if debug_counter % 300 == 0 {
+                    let l = input_buf[0];
+                    let r = input_buf[1];
+                    let max_val = input_buf[..samples_read].iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+                    if max_val > 0.0001 {
+                        info!("Passthrough Audio detected! Max: {:.4}, L: {:.4}, R: {:.4}", max_val, l, r);
+                    } else {
+                        info!("Passthrough Audio SILENCE? Max: {:.4}, L: {:.4}, R: {:.4}", max_val, l, r);
+                    }
+                }
+
+                // Convert to S16LE Stereo (Taking Ch 0 and 1 only for simplicity)
+                for i in 0..frames_read {
+                    let l = input_buf[i * 6];
+                    let r = input_buf[i * 6 + 1];
+                    
+                    let l_i16 = (l.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    let r_i16 = (r.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    
+                    let offset = i * 4;
+                    let lb = l_i16.to_le_bytes();
+                    let rb = r_i16.to_le_bytes();
+                    
+                    output_buf[offset] = lb[0];
+                    output_buf[offset + 1] = lb[1];
+                    output_buf[offset + 2] = rb[0];
+                    output_buf[offset + 3] = rb[1];
+                }
+                
+                // Write bytes
+                let bytes_to_write = frames_read * 4;
+                output.write(&output_buf[..bytes_to_write]).ok();
+            }
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    
+    info!("Passthrough loop exiting.");
     Ok(())
 }

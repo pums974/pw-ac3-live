@@ -10,11 +10,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 LOW_LATENCY_BUFFER_SIZE="${PW_AC3_BUFFER_SIZE:-6144}"
-LOW_LATENCY_OUTPUT_BUFFER_SIZE="${PW_AC3_OUTPUT_BUFFER_SIZE:-8192}"
+LOW_LATENCY_OUTPUT_BUFFER_SIZE="${PW_AC3_OUTPUT_BUFFER_SIZE:-3072}"
 LOW_LATENCY_NODE_LATENCY="${PW_AC3_NODE_LATENCY:-1536/48000}"
-LOW_LATENCY_THREAD_QUEUE="${PW_AC3_FFMPEG_THREAD_QUEUE_SIZE:-32}"
+LOW_LATENCY_THREAD_QUEUE="${PW_AC3_FFMPEG_THREAD_QUEUE_SIZE:-4}"
 LOW_LATENCY_CHUNK_FRAMES="${PW_AC3_FFMPEG_CHUNK_FRAMES:-1536}"
-ENABLE_LATENCY_PROFILE="${PW_AC3_PROFILE_LATENCY:-0}"
+ENABLE_LATENCY_PROFILE="${PW_AC3_PROFILE_LATENCY:-1}"
 TARGET_SINK_OVERRIDE="${PW_AC3_TARGET_SINK:-}"
 APP_TARGET_OVERRIDE="${PW_AC3_APP_TARGET:-}"
 CONNECT_TARGET_OVERRIDE="${PW_AC3_CONNECT_TARGET:-}"
@@ -30,6 +30,8 @@ DIRECT_ALSA_RESTORE_PROFILE_AFTER_OPEN="${PW_AC3_DIRECT_ALSA_RESTORE_PROFILE_AFT
 DIRECT_ALSA_IEC958_SCAN_ALL="${PW_AC3_DIRECT_ALSA_IEC958_SCAN_ALL:-1}"
 DIRECT_ALSA_USE_HDMI_PLUGIN="${PW_AC3_DIRECT_ALSA_USE_HDMI_PLUGIN:-0}"
 DIRECT_ALSA_HDMI_AES_PARAMS="${PW_AC3_DIRECT_ALSA_HDMI_AES_PARAMS:-AES0=0x6}"
+DIRECT_ALSA_BUFFER_TIME="${PW_AC3_DIRECT_ALSA_BUFFER_TIME:-60000}"
+DIRECT_ALSA_PERIOD_TIME="${PW_AC3_DIRECT_ALSA_PERIOD_TIME:-15000}"
 APP_BIN="${ROOT_DIR}/bin/pw-ac3-live"
 DEV_BIN="${ROOT_DIR}/target/release/pw-ac3-live"
 USE_PACKAGED_BINARY=0
@@ -414,18 +416,22 @@ launch_direct_aplay_pipeline() {
 
     if [ "$SHOW_RUNTIME_LOGS" = "1" ]; then
         (
+            # Shrink pipe buffer to minimum (4096 bytes) using python3 fcntl
+            # Shrink pipe buffer using dedicated shim script
             "${producer_cmd[@]}" 2> >(tee /tmp/pw-ac3-live.log >&2) | \
+            "$(dirname "$0")/reduce_pipe_latency.py" | \
             aplay -D "$aplay_device" \
                 --disable-resample --disable-format --disable-channels --disable-softvol \
-                -v -t raw -f S16_LE -r 48000 -c 2 --buffer-time=200000 --period-time=20000 \
+                -v -t raw -f S16_LE -r 48000 -c 2 --buffer-time="$DIRECT_ALSA_BUFFER_TIME" --period-time="$DIRECT_ALSA_PERIOD_TIME" \
                 2>&1 | tee /tmp/aplay.log
         ) &
     else
         (
             "${producer_cmd[@]}" 2>/tmp/pw-ac3-live.log | \
+            "$(dirname "$0")/reduce_pipe_latency.py" | \
             aplay -D "$aplay_device" \
                 --disable-resample --disable-format --disable-channels --disable-softvol \
-                -v -t raw -f S16_LE -r 48000 -c 2 --buffer-time=200000 --period-time=20000 \
+                -v -t raw -f S16_LE -r 48000 -c 2 --buffer-time="$DIRECT_ALSA_BUFFER_TIME" --period-time="$DIRECT_ALSA_PERIOD_TIME" \
                 > /tmp/aplay.log 2>&1
         ) &
     fi
@@ -669,10 +675,18 @@ apply_iec958_non_audio() {
     local card_index applied=0
     card_index=$(echo "$alsa_device" | cut -d',' -f1 | sed 's/hw://')
 
-    echo "Setting IEC958 Non-Audio bit on ALL indices (0..3) for card $card_index..."
+    local mode_arg="audio off"
+    local mode_desc="Non-Audio"
+    if [ "${PW_AC3_PASSTHROUGH:-0}" = "1" ]; then
+        mode_arg="audio on"
+        mode_desc="PCM Audio (Passthrough Mode)"
+    fi
+
+    echo "Setting IEC958 to '$mode_desc' on ALL indices (0..3) for card $card_index..."
     for idx in 0 1 2 3; do
-        if iecset -c "$card_index" -n "$idx" audio off rate 48000 >/dev/null 2>&1; then
-            echo "  index $idx: Non-Audio set."
+        # If passthrough, ensure "audio on"; if AC-3, ensure "audio off"
+        if iecset -c "$card_index" -n "$idx" $mode_arg rate 48000 >/dev/null 2>&1; then
+            echo "  index $idx: $mode_desc set."
             applied=1
         else
             echo "  index $idx: failed (may be locked or absent)."
@@ -1403,6 +1417,12 @@ else
     APP_CMD+=(cargo run --release --)
 fi
 
+    PASSTHROUGH_ARGS=()
+    if [ "${PW_AC3_PASSTHROUGH:-0}" = "1" ]; then
+        echo "WARNING: Enabling passthrough mode (No Encoding)."
+        PASSTHROUGH_ARGS=(--passthrough)
+    fi
+
 COMMON_ARGS=(
     --buffer-size "$effective_buffer_size"
     --latency "$LOW_LATENCY_NODE_LATENCY"
@@ -1410,6 +1430,7 @@ COMMON_ARGS=(
     --ffmpeg-chunk-frames "$LOW_LATENCY_CHUNK_FRAMES"
     "${OUTPUT_BUFFER_ARGS[@]}"
     "${PROFILE_LATENCY_ARGS[@]}"
+    "${PASSTHROUGH_ARGS[@]}"
 )
 
 if [ "$USE_DIRECT_APLAY" = "1" ]; then
@@ -1596,6 +1617,37 @@ echo "Pipeline launched with PID $APP_PID (pw-ac3-live log: /tmp/pw-ac3-live.log
 
     # Update cleanup trap to debug
     trap 'run_cleanup_once "DEBUG: Trap triggered at $(date). Cleaning up..."; exit' INT TERM EXIT
+
+    monitor_stats() {
+        echo "Starting stats monitor..."
+        while kill -0 "$APP_PID" 2>/dev/null; do
+            # Monitor aplay delay if available
+            if [ -n "$DIRECT_ALSA_HW_FALLBACK_DEVICE" ] || [ -n "$DIRECT_ALSA_APLAY_DEVICE" ]; then
+                local dev="${DIRECT_ALSA_APLAY_DEVICE:-$DIRECT_ALSA_HW_FALLBACK_DEVICE}"
+                local card="${dev#hw:}"
+                card="${card%%,*}"
+                local device="${dev##*,}"
+                local status_file="/proc/asound/card${card}/pcm${device}p/sub0/status"
+                if [ -f "$status_file" ]; then
+                    local delay=$(grep "delay" "$status_file" | awk '{print $3}')
+                    local avail=$(grep "avail" "$status_file" | awk '{print $3}')
+                    if [ -n "$delay" ]; then
+                        echo "STATS: aplay delay=${delay} frames ($((delay * 1000 / 48000)) ms) avail=${avail}"
+                    fi
+                fi
+            fi
+            
+            # Monitor pw-ac3-live latency logs
+            if [ -f "/tmp/pw-ac3-live.log" ]; then
+                tail -n 20 /tmp/pw-ac3-live.log | grep "latency" | tail -n 1
+            fi
+            
+            sleep 1
+        done
+    }
+
+    # Launch stats monitor in background
+    monitor_stats &
 
 # 6. Wait for Nodes
 echo "Waiting for pw-ac3-live-input node to appear..."

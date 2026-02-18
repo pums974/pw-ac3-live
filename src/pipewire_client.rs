@@ -666,6 +666,22 @@ pub fn run_pipewire_loop_with_config(
     let playback_target = resolve_playback_target(target_node.as_deref());
 
     if use_stdout {
+        // Shrink the process stdout pipe buffer to minimize latency to aplay.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let stdout_fd = std::io::stdout().as_raw_fd();
+            const F_SETPIPE_SZ: libc::c_int = 1031;
+            const F_GETPIPE_SZ: libc::c_int = 1032;
+            let old = unsafe { libc::fcntl(stdout_fd, F_GETPIPE_SZ) };
+            let ret = unsafe { libc::fcntl(stdout_fd, F_SETPIPE_SZ, 4096 as libc::c_int) };
+            if ret > 0 {
+                info!("Shrunk process stdout pipe from {} to {} bytes", old, ret);
+            } else {
+                log::warn!("Could not shrink process stdout pipe: {}", std::io::Error::last_os_error());
+            }
+        }
+
         // Spawn a thread to read from ring buffer and write to stdout
         let running_clone = running.clone();
         thread::spawn(move || {
