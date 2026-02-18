@@ -45,15 +45,6 @@ struct Args {
     /// Number of interleaved frames pushed to FFmpeg per write
     #[arg(long, default_value_t = 128)]
     ffmpeg_chunk_frames: usize,
-
-    /// Enable per-stage latency profiling logs (once per second)
-    #[arg(long, action)]
-    profile_latency: bool,
-
-    /// Passthrough mode: Direct PCM copy (Input Ch 0/1 -> Output) without FFmpeg encoding.
-    /// Used for latency testing.
-    #[arg(long, action)]
-    passthrough: bool,
 }
 
 fn main() -> Result<()> {
@@ -61,9 +52,6 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     info!("Starting pw-ac3-live...");
-    if args.passthrough {
-        info!("MODE: PASSTHROUGH (No FFmpeg AC-3 encoding)");
-    }
     info!("Target Sink: {:?}", args.target);
     info!("Buffer Size: {}", args.buffer_size);
     info!(
@@ -75,7 +63,6 @@ fn main() -> Result<()> {
         "FFmpeg queue/chunk: {} / {}",
         args.ffmpeg_thread_queue_size, args.ffmpeg_chunk_frames
     );
-    info!("Latency profiling: {}", args.profile_latency);
 
     // 1. Setup RingBuffers
     // SPSC (Single Producer Single Consumer) lock-free queues.
@@ -103,32 +90,25 @@ fn main() -> Result<()> {
     })
     .context("Error setting Ctrl-C handler")?;
 
-    // 3. Spawn Encoder (or Passthrough) Thread
+    // 3. Spawn Encoder Thread
     let encoder_running = running.clone();
     let encoder_config = encoder::EncoderConfig {
         ffmpeg_thread_queue_size: args.ffmpeg_thread_queue_size,
         feeder_chunk_frames: args.ffmpeg_chunk_frames,
-        profile_latency: args.profile_latency,
     };
-    let use_passthrough = args.passthrough;
     let encoder_handle = thread::spawn(move || {
-        if use_passthrough {
-            encoder::run_passthrough_loop(input_consumer, output_producer, encoder_running)
-        } else {
-            encoder::run_encoder_loop_with_config(
-                input_consumer,
-                output_producer,
-                encoder_running,
-                encoder_config,
-            )
-        }
+        encoder::run_encoder_loop_with_config(
+            input_consumer,
+            output_producer,
+            encoder_running,
+            encoder_config,
+        )
     });
 
     // 4. Start PipeWire Client (Main Thread or blocked)
     // logic to connect to PipeWire...
     let pipewire_config = pipewire_client::PipewireConfig {
         node_latency: args.latency,
-        profile_latency: args.profile_latency,
     };
     let pipewire_result = pipewire_client::run_pipewire_loop_with_config(
         input_producer,

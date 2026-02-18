@@ -1,11 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use log::{error, info, warn};
 use rtrb::{Consumer, Producer};
-use std::cmp::Ordering as CmpOrdering;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,12 +11,11 @@ use std::time::{Duration, Instant};
 use std::os::unix::io::AsRawFd;
 
 const INPUT_CHANNELS: usize = 6;
-const SAMPLE_RATE_HZ: f64 = 48_000.0;
-const OUTPUT_FRAME_BYTES: f64 = 4.0;
+
 const OUTPUT_FRAME_BYTES_U8: usize = 4;
 const MAX_STDOUT_READ_BUFFER_SIZE: usize = 1024;
 const MIN_STDOUT_READ_BUFFER_SIZE: usize = 512;
-const PROFILE_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Minimum pipe buffer size (4KB = one page, the kernel minimum).
 const TARGET_PIPE_SIZE: i32 = 4096;
 
@@ -52,7 +49,6 @@ fn shrink_pipe_buffer(fd: std::os::unix::io::RawFd, label: &str) {
 pub struct EncoderConfig {
     pub ffmpeg_thread_queue_size: usize,
     pub feeder_chunk_frames: usize,
-    pub profile_latency: bool,
 }
 
 impl Default for EncoderConfig {
@@ -60,120 +56,11 @@ impl Default for EncoderConfig {
         Self {
             ffmpeg_thread_queue_size: 128,
             feeder_chunk_frames: 128,
-            profile_latency: false,
         }
     }
 }
 
-#[derive(Default)]
-struct EncoderProfileWindow {
-    feeder_batch_ms: Vec<f64>,
-    feeder_queue_ms: Vec<f64>,
-    stdin_io_ms: Vec<f64>,
-    stdout_read_wait_ms: Vec<f64>,
-    output_queue_ms: Vec<f64>,
-    output_backpressure_ms: Vec<f64>,
-}
 
-#[derive(Default)]
-struct EncoderLatencyProfiler {
-    window: Mutex<EncoderProfileWindow>,
-}
-
-#[derive(Clone, Copy)]
-struct MetricSummary {
-    count: usize,
-    avg_ms: f64,
-    p50_ms: f64,
-    p95_ms: f64,
-    max_ms: f64,
-}
-
-impl EncoderLatencyProfiler {
-    fn record_feeder(&self, feeder_batch_ms: f64, feeder_queue_ms: f64, stdin_io_ms: f64) {
-        if let Ok(mut window) = self.window.try_lock() {
-            window.feeder_batch_ms.push(feeder_batch_ms);
-            window.feeder_queue_ms.push(feeder_queue_ms);
-            window.stdin_io_ms.push(stdin_io_ms);
-        }
-    }
-
-    fn record_reader(
-        &self,
-        stdout_read_wait_ms: f64,
-        output_queue_ms: f64,
-        output_backpressure_ms: f64,
-    ) {
-        if let Ok(mut window) = self.window.try_lock() {
-            window.stdout_read_wait_ms.push(stdout_read_wait_ms);
-            window.output_queue_ms.push(output_queue_ms);
-            window.output_backpressure_ms.push(output_backpressure_ms);
-        }
-    }
-
-    fn snapshot(&self) -> Option<EncoderProfileWindow> {
-        let mut window = self.window.lock().ok()?;
-        let is_empty = window.feeder_batch_ms.is_empty()
-            && window.feeder_queue_ms.is_empty()
-            && window.stdin_io_ms.is_empty()
-            && window.stdout_read_wait_ms.is_empty()
-            && window.output_queue_ms.is_empty()
-            && window.output_backpressure_ms.is_empty();
-        if is_empty {
-            return None;
-        }
-        Some(std::mem::take(&mut *window))
-    }
-}
-
-fn summarize_ms(values: &mut [f64]) -> Option<MetricSummary> {
-    if values.is_empty() {
-        return None;
-    }
-
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(CmpOrdering::Equal));
-
-    let count = values.len();
-    let sum: f64 = values.iter().sum();
-    let avg_ms = sum / (count as f64);
-    let p50_idx = ((count - 1) * 50) / 100;
-    let p95_idx = ((count - 1) * 95) / 100;
-
-    Some(MetricSummary {
-        count,
-        avg_ms,
-        p50_ms: values[p50_idx],
-        p95_ms: values[p95_idx],
-        max_ms: *values.last().unwrap_or(&0.0),
-    })
-}
-
-fn log_encoder_profile_snapshot(profiler: &EncoderLatencyProfiler) {
-    let Some(mut window) = profiler.snapshot() else {
-        return;
-    };
-
-    let metrics = [
-        ("feeder.batch_ms", &mut window.feeder_batch_ms),
-        ("feeder.queue_delay_ms", &mut window.feeder_queue_ms),
-        ("feeder.stdin_io_ms", &mut window.stdin_io_ms),
-        ("reader.stdout_wait_ms", &mut window.stdout_read_wait_ms),
-        ("reader.output_queue_delay_ms", &mut window.output_queue_ms),
-        (
-            "reader.output_backpressure_ms",
-            &mut window.output_backpressure_ms,
-        ),
-    ];
-
-    for (name, values) in metrics {
-        if let Some(summary) = summarize_ms(values.as_mut_slice()) {
-            info!(
-                "latency[encoder] {} n={} avg={:.2} p50={:.2} p95={:.2} max={:.2}",
-                name, summary.count, summary.avg_ms, summary.p50_ms, summary.p95_ms, summary.max_ms
-            );
-        }
-    }
-}
 
 /// Manages the FFmpeg subprocess for encoding.
 ///
@@ -203,10 +90,7 @@ pub fn run_encoder_loop_with_config(
 
     let ffmpeg_thread_queue_size = config.ffmpeg_thread_queue_size.max(1);
     let feeder_chunk_frames = config.feeder_chunk_frames.max(1);
-    let profile_latency = config.profile_latency;
     let ffmpeg_thread_queue_size_arg = ffmpeg_thread_queue_size.to_string();
-    let profiler = profile_latency.then(|| Arc::new(EncoderLatencyProfiler::default()));
-    let profile_reporter_running = Arc::new(AtomicBool::new(true));
 
     // Command:
     // ffmpeg -y -f f32le -ar 48000 -ac 6 -i pipe:0 -c:ac3 -b:a 640k -f spdif pipe:1
@@ -231,20 +115,12 @@ pub fn run_encoder_loop_with_config(
         "-i", "pipe:0", // Input
     ]);
 
-    if std::env::var("PW_AC3_TEST_FFMPEG_PCM").unwrap_or_else(|_| "0".to_string()) == "1" {
-        info!("TEST MODE: Using FFmpeg PCM S16LE passthrough (No AC-3 encoding)");
-        command.args([
-            "-c:a", "pcm_s16le",
-            "-f", "s16le",
-        ]);
-    } else {
-        command.args([
-            "-c:a", "ac3",
-            "-b:a", "640k", 
-            "-bufsize", "0", 
-            "-f", "spdif", 
-        ]);
-    }
+    command.args([
+        "-c:a", "ac3",
+        "-b:a", "640k", 
+        "-bufsize", "0", 
+        "-f", "spdif", 
+    ]);
 
     // Muxer / Output flags
     command.args([
@@ -279,9 +155,8 @@ pub fn run_encoder_loop_with_config(
         shrink_pipe_buffer(stdout.as_raw_fd(), "ffmpeg-stdout");
     }
 
+
     let running_feeder = running.clone();
-    let profiler_feeder = profiler.clone();
-    let profiler_reader = profiler.clone();
     let output_capacity = output.slots();
     // Keep read chunks small enough to avoid bursty output->playback pressure.
     let mut stdout_read_buffer_size = (output_capacity / 8)
@@ -295,17 +170,7 @@ pub fn run_encoder_loop_with_config(
         stdout_read_buffer_size, output_capacity
     );
 
-    let profile_reporter_handle = profiler.as_ref().map(|profiler| {
-        let reporter_running = profile_reporter_running.clone();
-        let profiler = profiler.clone();
-        thread::spawn(move || {
-            while reporter_running.load(Ordering::Relaxed) {
-                thread::sleep(PROFILE_REPORT_INTERVAL);
-                log_encoder_profile_snapshot(&profiler);
-            }
-            log_encoder_profile_snapshot(&profiler);
-        })
-    });
+
 
     // Spawn Feeder Thread (RingBuffer -> Stdin)
     let feeder_handle = thread::spawn(move || -> Result<()> {
@@ -316,12 +181,10 @@ pub fn run_encoder_loop_with_config(
             // We want to move data as fast as possible.
             let readable_samples = input.slots();
             if readable_samples > 0 {
-                let feeder_queue_delay_ms =
-                    (readable_samples as f64 / (INPUT_CHANNELS as f64 * SAMPLE_RATE_HZ)) * 1000.0;
                 if let Ok(chunk) =
                     input.read_chunk(readable_samples.min(feeder_chunk_frames * INPUT_CHANNELS))
                 {
-                    let feeder_batch_started = Instant::now();
+
                     // Copy to local buffer
                     byte_buffer.clear();
                     for sample in chunk {
@@ -330,28 +193,21 @@ pub fn run_encoder_loop_with_config(
                     }
 
                     // Write to stdin
-                    let stdin_io_started = Instant::now();
                     if let Err(e) = stdin.write_all(&byte_buffer) {
                         if running_feeder.load(Ordering::Relaxed) {
-                            return Err(anyhow!(e).context("Failed to write to ffmpeg stdin"));
+                            return Err(anyhow::Error::new(e).context("Failed to write to ffmpeg stdin"));
                         }
                         break;
                     }
                     // Force flush to prevent buffering in the pipe
                     if let Err(e) = stdin.flush() {
                         if running_feeder.load(Ordering::Relaxed) {
-                            return Err(anyhow!(e).context("Failed to flush ffmpeg stdin"));
+                            return Err(anyhow::Error::new(e).context("Failed to flush ffmpeg stdin"));
                         }
                         break;
                     }
 
-                    if let Some(profiler) = profiler_feeder.as_ref() {
-                        profiler.record_feeder(
-                            feeder_batch_started.elapsed().as_secs_f64() * 1000.0,
-                            feeder_queue_delay_ms,
-                            stdin_io_started.elapsed().as_secs_f64() * 1000.0,
-                        );
-                    }
+
                 } else {
                     thread::sleep(Duration::from_micros(250));
                 }
@@ -369,7 +225,7 @@ pub fn run_encoder_loop_with_config(
 
     loop {
         // Read from stdout
-        let stdout_read_started = Instant::now();
+
         match stdout.read(&mut read_buffer) {
             Ok(0) => {
                 if running.load(Ordering::Relaxed) {
@@ -383,10 +239,8 @@ pub fn run_encoder_loop_with_config(
                 // We need to write all `n` bytes.
                 let mut bytes_written = 0;
                 let mut abort_due_to_shutdown_backpressure = false;
-                let output_readable = output_capacity.saturating_sub(output.slots());
-                let output_queue_delay_ms =
-                    (output_readable as f64 / (OUTPUT_FRAME_BYTES * SAMPLE_RATE_HZ)) * 1000.0;
-                let mut backpressure_delay_ms = 0.0;
+
+
                 while bytes_written < n {
                     if output.slots() > 0 {
                         let request = (n - bytes_written).min(output.slots());
@@ -407,7 +261,7 @@ pub fn run_encoder_loop_with_config(
                                     break;
                                 }
                                 thread::sleep(Duration::from_micros(100));
-                                backpressure_delay_ms += 0.1;
+        
                             }
                         }
                     } else {
@@ -416,17 +270,11 @@ pub fn run_encoder_loop_with_config(
                             break;
                         }
                         thread::sleep(Duration::from_micros(250));
-                        backpressure_delay_ms += 0.25;
+
                     }
                 }
 
-                if let Some(profiler) = profiler_reader.as_ref() {
-                    profiler.record_reader(
-                        stdout_read_started.elapsed().as_secs_f64() * 1000.0,
-                        output_queue_delay_ms,
-                        backpressure_delay_ms,
-                    );
-                }
+
 
                 if abort_due_to_shutdown_backpressure {
                     break;
@@ -435,7 +283,7 @@ pub fn run_encoder_loop_with_config(
             Err(e) => {
                 if running.load(Ordering::Relaxed) {
                     error!("Error reading ffmpeg stdout: {}", e);
-                    reader_error = Some(anyhow!(e).context("Error reading ffmpeg stdout"));
+                    reader_error = Some(anyhow::Error::new(e).context("Error reading ffmpeg stdout"));
                 }
                 break;
             }
@@ -459,7 +307,7 @@ pub fn run_encoder_loop_with_config(
 
     let deadline = Instant::now() + Duration::from_millis(500);
     let mut forced_kill = false;
-    let child_status = loop {
+    let child_status: Option<std::process::ExitStatus> = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
@@ -473,7 +321,7 @@ pub fn run_encoder_loop_with_config(
             Err(e) => {
                 if reader_error.is_none() {
                     reader_error =
-                        Some(anyhow!(e).context("Failed to query ffmpeg process status"));
+                        Some(anyhow::Error::new(e).context("Failed to query ffmpeg process status"));
                 }
                 forced_kill = true;
                 let _ = child.kill();
@@ -482,10 +330,7 @@ pub fn run_encoder_loop_with_config(
         }
     };
 
-    profile_reporter_running.store(false, Ordering::Relaxed);
-    if let Some(handle) = profile_reporter_handle {
-        let _ = handle.join();
-    }
+
 
     if running.load(Ordering::Relaxed) {
         if let Some(err) = reader_error {
@@ -506,87 +351,4 @@ pub fn run_encoder_loop_with_config(
     Ok(())
 }
 
-/// Runs a passthrough loop that copies audio from input to output without encoding.
-/// Converts 6-channel F32LE input to 2-channel S16LE output (Stereo downmix/truncation).
-pub fn run_passthrough_loop(
-    mut input: Consumer<f32>,
-    mut output: Producer<u8>,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    info!("Starting Passthrough Loop (PCM Direct Copy: 6ch Float -> 2ch S16LE)...");
 
-    const CHUNK_FRAMES: usize = 128;
-    // Buffer for 128 frames * 6 channels = 768 floats
-    let mut input_buf = [0.0f32; 6 * CHUNK_FRAMES];
-    // Buffer for 128 frames * 2 channels * 2 bytes = 512 bytes
-    let mut output_buf = [0u8; 4 * CHUNK_FRAMES];
-    let mut debug_counter = 0;
-
-    while running.load(Ordering::Relaxed) {
-        let in_slots = input.slots();
-        let out_slots = output.slots();
-        
-        let frames_in = in_slots / 6;
-        let frames_out = out_slots / 4;
-        let count = frames_in.min(frames_out).min(CHUNK_FRAMES);
-
-        if count > 0 {
-            let samples_in = count * 6;
-            
-            // Read floats manually
-            let mut samples_read = 0;
-            for i in 0..samples_in {
-                match input.pop() {
-                    Ok(sample) => {
-                        input_buf[i] = sample;
-                        samples_read += 1;
-                    }
-                    Err(_) => break,
-                }
-            }
-            
-            let frames_read = samples_read / 6;
-            if frames_read > 0 {
-                // Debug logging every ~1 second (approx 375 chunks @ 128 frames, 48kHz)
-                debug_counter += 1;
-                if debug_counter % 300 == 0 {
-                    let l = input_buf[0];
-                    let r = input_buf[1];
-                    let max_val = input_buf[..samples_read].iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-                    if max_val > 0.0001 {
-                        info!("Passthrough Audio detected! Max: {:.4}, L: {:.4}, R: {:.4}", max_val, l, r);
-                    } else {
-                        info!("Passthrough Audio SILENCE? Max: {:.4}, L: {:.4}, R: {:.4}", max_val, l, r);
-                    }
-                }
-
-                // Convert to S16LE Stereo (Taking Ch 0 and 1 only for simplicity)
-                for i in 0..frames_read {
-                    let l = input_buf[i * 6];
-                    let r = input_buf[i * 6 + 1];
-                    
-                    let l_i16 = (l.clamp(-1.0, 1.0) * 32767.0) as i16;
-                    let r_i16 = (r.clamp(-1.0, 1.0) * 32767.0) as i16;
-                    
-                    let offset = i * 4;
-                    let lb = l_i16.to_le_bytes();
-                    let rb = r_i16.to_le_bytes();
-                    
-                    output_buf[offset] = lb[0];
-                    output_buf[offset + 1] = lb[1];
-                    output_buf[offset + 2] = rb[0];
-                    output_buf[offset + 3] = rb[1];
-                }
-                
-                // Write bytes
-                let bytes_to_write = frames_read * 4;
-                output.write(&output_buf[..bytes_to_write]).ok();
-            }
-        } else {
-            thread::sleep(Duration::from_millis(1));
-        }
-    }
-    
-    info!("Passthrough loop exiting.");
-    Ok(())
-}

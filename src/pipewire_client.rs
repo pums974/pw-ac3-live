@@ -7,7 +7,7 @@ use pipewire::spa::param::audio::{AudioFormat, AudioInfoRaw};
 use pipewire::spa::utils::Direction;
 use pipewire::stream::{StreamFlags, StreamRef};
 use rtrb::{Consumer, Producer};
-use std::cmp::Ordering as CmpOrdering;
+
 use std::io::{Read, Write};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,131 +21,22 @@ const SAMPLE_RATE: &str = "48000";
 const SAMPLE_RATE_HZ: u32 = 48_000;
 const STDOUT_READ_BUFFER_SIZE: usize = 4096;
 const OUTPUT_FRAME_BYTES: usize = OUTPUT_CHANNELS * size_of::<i16>();
-const PROFILE_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
 
 #[derive(Debug, Clone)]
 pub struct PipewireConfig {
     pub node_latency: String,
-    pub profile_latency: bool,
 }
 
 impl Default for PipewireConfig {
     fn default() -> Self {
         Self {
             node_latency: "64/48000".to_string(),
-            profile_latency: false,
         }
     }
 }
 
-#[derive(Default)]
-struct PipewireProfileWindow {
-    capture_callback_ms: Vec<f64>,
-    capture_queue_delay_ms: Vec<f64>,
-    playback_callback_ms: Vec<f64>,
-    playback_queue_delay_ms: Vec<f64>,
-    capture_dropped_frames: u64,
-    playback_underruns: u64,
-}
 
-#[derive(Default)]
-struct PipewireLatencyProfiler {
-    window: Mutex<PipewireProfileWindow>,
-}
-
-#[derive(Clone, Copy)]
-struct MetricSummary {
-    count: usize,
-    avg_ms: f64,
-    p50_ms: f64,
-    p95_ms: f64,
-    max_ms: f64,
-}
-
-impl PipewireLatencyProfiler {
-    fn record_capture(&self, callback_ms: f64, queue_delay_ms: f64, dropped_frames: u64) {
-        if let Ok(mut window) = self.window.try_lock() {
-            window.capture_callback_ms.push(callback_ms);
-            window.capture_queue_delay_ms.push(queue_delay_ms);
-            window.capture_dropped_frames =
-                window.capture_dropped_frames.saturating_add(dropped_frames);
-        }
-    }
-
-    fn record_playback(&self, callback_ms: f64, queue_delay_ms: f64, underrun: bool) {
-        if let Ok(mut window) = self.window.try_lock() {
-            window.playback_callback_ms.push(callback_ms);
-            window.playback_queue_delay_ms.push(queue_delay_ms);
-            if underrun {
-                window.playback_underruns = window.playback_underruns.saturating_add(1);
-            }
-        }
-    }
-
-    fn snapshot(&self) -> Option<PipewireProfileWindow> {
-        let mut window = self.window.lock().ok()?;
-        let is_empty = window.capture_callback_ms.is_empty()
-            && window.capture_queue_delay_ms.is_empty()
-            && window.playback_callback_ms.is_empty()
-            && window.playback_queue_delay_ms.is_empty()
-            && window.capture_dropped_frames == 0
-            && window.playback_underruns == 0;
-        if is_empty {
-            return None;
-        }
-        Some(std::mem::take(&mut *window))
-    }
-}
-
-fn summarize_ms(values: &mut [f64]) -> Option<MetricSummary> {
-    if values.is_empty() {
-        return None;
-    }
-
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(CmpOrdering::Equal));
-    let count = values.len();
-    let sum: f64 = values.iter().sum();
-    let p50_idx = ((count - 1) * 50) / 100;
-    let p95_idx = ((count - 1) * 95) / 100;
-
-    Some(MetricSummary {
-        count,
-        avg_ms: sum / (count as f64),
-        p50_ms: values[p50_idx],
-        p95_ms: values[p95_idx],
-        max_ms: *values.last().unwrap_or(&0.0),
-    })
-}
-
-fn log_pipewire_metric(name: &str, values: &mut Vec<f64>) {
-    if let Some(summary) = summarize_ms(values.as_mut_slice()) {
-        info!(
-            "latency[pipewire] {} n={} avg={:.2} p50={:.2} p95={:.2} max={:.2}",
-            name, summary.count, summary.avg_ms, summary.p50_ms, summary.p95_ms, summary.max_ms
-        );
-    }
-}
-
-fn log_pipewire_profile_snapshot(profiler: &PipewireLatencyProfiler) {
-    let Some(mut window) = profiler.snapshot() else {
-        return;
-    };
-
-    log_pipewire_metric("capture.callback_ms", &mut window.capture_callback_ms);
-    log_pipewire_metric("capture.queue_delay_ms", &mut window.capture_queue_delay_ms);
-    log_pipewire_metric("playback.callback_ms", &mut window.playback_callback_ms);
-    log_pipewire_metric(
-        "playback.queue_delay_ms",
-        &mut window.playback_queue_delay_ms,
-    );
-
-    if window.capture_dropped_frames > 0 || window.playback_underruns > 0 {
-        info!(
-            "latency[pipewire] capture.dropped_frames={} playback.underruns={}",
-            window.capture_dropped_frames, window.playback_underruns
-        );
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlaybackTarget {
@@ -403,17 +294,12 @@ pub fn run_pipewire_loop_with_config(
     } else {
         config.node_latency.as_str()
     };
-    let profile_latency = config.profile_latency;
     let requested_latency_frames = node_latency
         .split('/')
         .next()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|frames| *frames > 0);
-    let profiler = profile_latency.then(|| Arc::new(PipewireLatencyProfiler::default()));
-    let profile_reporter_running = Arc::new(AtomicBool::new(true));
-    let capture_profiler = profiler.clone();
-    let playback_profiler = profiler.clone();
-    let input_capacity = input_producer.slots();
+
 
     pw::init();
 
@@ -484,7 +370,7 @@ pub fn run_pipewire_loop_with_config(
             match stream.dequeue_buffer() {
                 None => (),
                 Some(mut buffer) => {
-                    let capture_started = std::time::Instant::now();
+
                     let datas = buffer.datas_mut();
                     if datas.is_empty() {
                         return;
@@ -590,12 +476,7 @@ pub fn run_pipewire_loop_with_config(
                         return;
                     }
 
-                    let mut capture_queue_delay_ms = 0.0;
-                    let dropped_frames = if let Ok(mut producer) = data.try_lock() {
-                        let queued_samples = input_capacity.saturating_sub(producer.slots());
-                        capture_queue_delay_ms = (queued_samples as f64
-                            / (INPUT_CHANNELS as f64 * SAMPLE_RATE_HZ as f64))
-                            * 1000.0;
+                    if let Ok(mut producer) = data.try_lock() {
 
                         let writable = producer.slots().min(interleaved_scratch.len());
                         let frame_aligned_writable = writable - (writable % INPUT_CHANNELS);
@@ -625,13 +506,7 @@ pub fn run_pipewire_loop_with_config(
                         (interleaved_scratch.len() / INPUT_CHANNELS) as u64
                     };
 
-                    if let Some(profiler) = capture_profiler.as_ref() {
-                        profiler.record_capture(
-                            capture_started.elapsed().as_secs_f64() * 1000.0,
-                            capture_queue_delay_ms,
-                            dropped_frames,
-                        );
-                    }
+
                 }
             }
         })
@@ -764,14 +639,14 @@ pub fn run_pipewire_loop_with_config(
                 move |stream: &StreamRef, _data| match stream.dequeue_buffer() {
                     None => (),
                     Some(mut buffer) => {
-                        let playback_started = std::time::Instant::now();
+    
                         let datas = buffer.datas_mut();
                         if datas.is_empty() {
                             return;
                         }
 
-                        let mut playback_queue_delay_ms = 0.0;
-                        let (to_write, underrun) = {
+    
+                        let (to_write, _) = {
                             let Some(raw_data) = datas[0].data() else {
                                 return;
                             };
@@ -809,11 +684,9 @@ pub fn run_pipewire_loop_with_config(
                             // loopback quantums (e.g. 64 KiB+) makes the ring sit near-full,
                             // which amplifies backpressure and capture drops.
                             let prefill_target = target_write.min(prefill_limit);
-                            let underrun = if let Ok(mut consumer) = output_data.try_lock() {
+                            if let Ok(mut consumer) = output_data.try_lock() {
                                 let available = consumer.slots();
-                                playback_queue_delay_ms = (available as f64
-                                    / (OUTPUT_FRAME_BYTES as f64 * SAMPLE_RATE_HZ as f64))
-                                    * 1000.0;
+       
 
                                 if !playback_primed.load(Ordering::Relaxed) {
                                     if available >= prefill_target {
@@ -836,23 +709,14 @@ pub fn run_pipewire_loop_with_config(
                                     if readable == 0 {
                                         // Lost headroom; fall back to silence and re-prime.
                                         playback_primed.store(false, Ordering::Relaxed);
-                                        true
                                     } else if let Ok(chunk) = consumer.read_chunk(readable) {
                                         for (i, byte) in chunk.into_iter().enumerate() {
                                             raw_data[i] = byte;
                                         }
-                                        readable < target_write
-                                    } else {
-                                        true
                                     }
-                                } else {
-                                // Startup prefill phase: output silence without counting underruns.
-                                false
+                                }
                             }
-                        } else {
-                            true
-                        };
-                            (target_write, underrun)
+                            (target_write, false)
                         };
 
                         let chunk = datas[0].chunk_mut();
@@ -860,13 +724,7 @@ pub fn run_pipewire_loop_with_config(
                         *chunk.stride_mut() = OUTPUT_FRAME_BYTES as i32;
                         *chunk.size_mut() = to_write as u32;
 
-                        if let Some(profiler) = playback_profiler.as_ref() {
-                            profiler.record_playback(
-                                playback_started.elapsed().as_secs_f64() * 1000.0,
-                                playback_queue_delay_ms,
-                                underrun,
-                            );
-                        }
+
                     }
                 },
             )
@@ -890,18 +748,6 @@ pub fn run_pipewire_loop_with_config(
         _playback_listener_handle = Some(playback_listener);
     }
 
-    let profile_reporter_handle = profiler.as_ref().map(|profiler| {
-        let reporter_running = profile_reporter_running.clone();
-        let profiler = profiler.clone();
-        thread::spawn(move || {
-            while reporter_running.load(Ordering::Relaxed) {
-                thread::sleep(PROFILE_REPORT_INTERVAL);
-                log_pipewire_profile_snapshot(&profiler);
-            }
-            log_pipewire_profile_snapshot(&profiler);
-        })
-    });
-
     info!("PipeWire loop running. Press Ctrl+C to stop.");
 
     // Timer to check running
@@ -923,10 +769,8 @@ pub fn run_pipewire_loop_with_config(
 
     mainloop.run();
 
-    profile_reporter_running.store(false, Ordering::Relaxed);
-    if let Some(handle) = profile_reporter_handle {
-        let _ = handle.join();
-    }
+
+
 
     Ok(())
 }

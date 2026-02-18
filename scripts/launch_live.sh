@@ -14,20 +14,16 @@ LOW_LATENCY_OUTPUT_BUFFER_SIZE="${PW_AC3_OUTPUT_BUFFER_SIZE:-3072}"
 LOW_LATENCY_NODE_LATENCY="${PW_AC3_NODE_LATENCY:-1536/48000}"
 LOW_LATENCY_THREAD_QUEUE="${PW_AC3_FFMPEG_THREAD_QUEUE_SIZE:-4}"
 LOW_LATENCY_CHUNK_FRAMES="${PW_AC3_FFMPEG_CHUNK_FRAMES:-1536}"
-ENABLE_LATENCY_PROFILE="${PW_AC3_PROFILE_LATENCY:-1}"
+
 TARGET_SINK_OVERRIDE="${PW_AC3_TARGET_SINK:-}"
 APP_TARGET_OVERRIDE="${PW_AC3_APP_TARGET:-}"
 CONNECT_TARGET_OVERRIDE="${PW_AC3_CONNECT_TARGET:-}"
 PLAYBACK_MODE="${PW_AC3_PLAYBACK_MODE:-native}"
 DIRECT_ALSA_DEVICE_OVERRIDE="${PW_AC3_DIRECT_ALSA_DEVICE:-}"
 DIRECT_ALSA_DISABLE_PROFILE="${PW_AC3_DIRECT_ALSA_DISABLE_PROFILE:-0}"
-SHOW_RUNTIME_LOGS="${PW_AC3_SHOW_RUNTIME_LOGS:-0}"
-DIRECT_ALSA_FALLBACK="${PW_AC3_DIRECT_ALSA_FALLBACK:-1}"
+
 DIRECT_ALSA_AUTO_IEC958="${PW_AC3_DIRECT_ALSA_AUTO_IEC958:-1}"
-DIRECT_ALSA_FORCE_PROFILE_DEVICE="${PW_AC3_DIRECT_ALSA_FORCE_PROFILE_DEVICE:-1}"
 DIRECT_ALSA_SKIP_IECSET="${PW_AC3_DIRECT_ALSA_SKIP_IECSET:-0}"
-DIRECT_ALSA_RESTORE_PROFILE_AFTER_OPEN="${PW_AC3_DIRECT_ALSA_RESTORE_PROFILE_AFTER_OPEN:-0}"
-DIRECT_ALSA_IEC958_SCAN_ALL="${PW_AC3_DIRECT_ALSA_IEC958_SCAN_ALL:-1}"
 DIRECT_ALSA_USE_HDMI_PLUGIN="${PW_AC3_DIRECT_ALSA_USE_HDMI_PLUGIN:-0}"
 DIRECT_ALSA_HDMI_AES_PARAMS="${PW_AC3_DIRECT_ALSA_HDMI_AES_PARAMS:-AES0=0x6}"
 DIRECT_ALSA_BUFFER_TIME="${PW_AC3_DIRECT_ALSA_BUFFER_TIME:-60000}"
@@ -111,16 +107,6 @@ restore_runtime_audio_state() {
         fi
     fi
 
-    # If direct ALSA was used and original default is loopback HDMI-only, prefer internal sink fallback.
-    if [ "${USE_DIRECT_APLAY:-0}" = "1" ] && [ -n "$restore_sink" ] && [[ "$restore_sink" == alsa_loopback_device.*hdmi* ]]; then
-        if ! has_visible_physical_hdmi_sink; then
-            internal_fallback="$(find_internal_recovery_sink || true)"
-            if [ -n "$internal_fallback" ]; then
-                echo "Info: Recovery fallback to internal sink '$internal_fallback' (physical HDMI sink not visible)."
-                restore_sink="$internal_fallback"
-            fi
-        fi
-    fi
 
     if [ -n "$restore_sink" ]; then
         if ! sink_name_exists "$restore_sink"; then
@@ -414,27 +400,14 @@ launch_direct_aplay_pipeline() {
 
     eval "producer_cmd=(\"\${${producer_cmd_var}[@]}\")"
 
-    if [ "$SHOW_RUNTIME_LOGS" = "1" ]; then
-        (
-            # Shrink pipe buffer to minimum (4096 bytes) using python3 fcntl
-            # Shrink pipe buffer using dedicated shim script
-            "${producer_cmd[@]}" 2> >(tee /tmp/pw-ac3-live.log >&2) | \
-            "$(dirname "$0")/reduce_pipe_latency.py" | \
-            aplay -D "$aplay_device" \
-                --disable-resample --disable-format --disable-channels --disable-softvol \
-                -v -t raw -f S16_LE -r 48000 -c 2 --buffer-time="$DIRECT_ALSA_BUFFER_TIME" --period-time="$DIRECT_ALSA_PERIOD_TIME" \
-                2>&1 | tee /tmp/aplay.log
-        ) &
-    else
-        (
-            "${producer_cmd[@]}" 2>/tmp/pw-ac3-live.log | \
-            "$(dirname "$0")/reduce_pipe_latency.py" | \
-            aplay -D "$aplay_device" \
-                --disable-resample --disable-format --disable-channels --disable-softvol \
-                -v -t raw -f S16_LE -r 48000 -c 2 --buffer-time="$DIRECT_ALSA_BUFFER_TIME" --period-time="$DIRECT_ALSA_PERIOD_TIME" \
-                > /tmp/aplay.log 2>&1
-        ) &
-    fi
+    (
+        "${producer_cmd[@]}" 2>/tmp/pw-ac3-live.log | \
+        "$(dirname "$0")/reduce_pipe_latency.py" | \
+        aplay -D "$aplay_device" \
+            --disable-resample --disable-format --disable-channels --disable-softvol \
+            -v -t raw -f S16_LE -r 48000 -c 2 --buffer-time="$DIRECT_ALSA_BUFFER_TIME" --period-time="$DIRECT_ALSA_PERIOD_TIME" \
+            > /tmp/aplay.log 2>&1
+    ) &
     APP_PID=$!
 
     # Give aplay a moment to open the device before moving on.
@@ -464,78 +437,7 @@ pipewire_input_node_exists() {
     '
 }
 
-profile_suffix_to_alsa_device_number() {
-    local suffix="$1"
-    case "$suffix" in
-        *"extra1") echo "7" ;;
-        *"extra2") echo "8" ;;
-        *"extra3") echo "9" ;;
-        *) echo "3" ;;
-    esac
-}
 
-hdmi_pin_to_pcm_device_number() {
-    local pin="$1"
-    [[ "$pin" =~ ^[0-9]+$ ]] || return 1
-    if [ "$pin" -eq 0 ]; then
-        echo "3"
-    else
-        # HDA HDMI convention: pin 1 -> device 7, pin 2 -> device 8, pin 3 -> device 9, ...
-        echo $((pin + 6))
-    fi
-}
-
-find_active_hdmi_device_from_eld() {
-    local card_num="$1"
-    local profile_suffix="$2"
-    local base="/proc/asound/card${card_num}"
-    local preferred_pin=""
-    local file pin monitor_present eld_valid dev
-
-    [ -d "$base" ] || return 1
-
-    case "$profile_suffix" in
-        *"extra1") preferred_pin="1" ;;
-        *"extra2") preferred_pin="2" ;;
-        *"extra3") preferred_pin="3" ;;
-        *) preferred_pin="0" ;;
-    esac
-
-    # First pass: preferred pin from the profile suffix.
-    for file in "$base"/eld#*.*; do
-        [ -f "$file" ] || continue
-        pin="${file##*eld#}"
-        pin="${pin%%.*}"
-        monitor_present="$(awk '/monitor_present/{print $2; exit}' "$file")"
-        eld_valid="$(awk '/eld_valid/{print $2; exit}' "$file")"
-        [ "$pin" = "$preferred_pin" ] || continue
-        if [ "$monitor_present" = "1" ] && [ "$eld_valid" = "1" ]; then
-            dev="$(hdmi_pin_to_pcm_device_number "$pin" || true)"
-            if [ -n "$dev" ]; then
-                echo "$dev"
-                return 0
-            fi
-        fi
-    done
-
-    # Second pass: any active/valid HDMI ELD on this card.
-    for file in "$base"/eld#*.*; do
-        [ -f "$file" ] || continue
-        pin="${file##*eld#}"
-        pin="${pin%%.*}"
-        monitor_present="$(awk '/monitor_present/{print $2; exit}' "$file")"
-        eld_valid="$(awk '/eld_valid/{print $2; exit}' "$file")"
-        if [ "$monitor_present" = "1" ] && [ "$eld_valid" = "1" ]; then
-            dev="$(hdmi_pin_to_pcm_device_number "$pin" || true)"
-            if [ -n "$dev" ]; then
-                echo "$dev"
-                return 0
-            fi
-        fi
-    done
-
-    return 1
-}
 
 normalize_profile_suffix_for_ac3() {
     local suffix="$1"
@@ -547,101 +449,7 @@ normalize_profile_suffix_for_ac3() {
     esac
 }
 
-card_name_to_pci_bdf() {
-    local card_name="$1"
-    local token=""
 
-    [ -n "$card_name" ] || return 1
-    token="${card_name#*pci-}"
-    [ "$token" != "$card_name" ] || return 1
-
-    # alsa_card.pci-0000_04_00.1 -> 0000:04:00.1
-    token="${token%%.*}.${token##*.}"
-    token="${token/_/:}"
-    token="${token/_/:}"
-    echo "$token"
-}
-
-find_alsa_card_number_for_pci_bdf() {
-    local bdf="$1"
-    local card_dir dev_path card_num
-
-    [ -n "$bdf" ] || return 1
-    for card_dir in /sys/class/sound/card*; do
-        [ -d "$card_dir" ] || continue
-        dev_path="$(readlink -f "$card_dir/device" 2>/dev/null || true)"
-        if [ -n "$dev_path" ] && echo "$dev_path" | grep -q "$bdf"; then
-            card_num="${card_dir##*card}"
-            if [[ "$card_num" =~ ^[0-9]+$ ]]; then
-                echo "$card_num"
-                return 0
-            fi
-        fi
-    done
-    return 1
-}
-
-find_alsa_card_number_for_card_name() {
-    local card_name="$1"
-    local card_num=""
-    local pci_bdf=""
-    [ -n "$card_name" ] || return 1
-    card_num="$(pactl list cards | awk -v target="$card_name" '
-        $1=="Name:" && $2==target { in_card=1; next }
-        in_card && $0 ~ /api\.alsa\.card/ {
-            line = $0;
-            gsub(/.*"/, "", line);
-            gsub(/".*/, "", line);
-            if (line ~ /^[0-9]+$/) {
-                print line;
-                exit;
-            }
-        }
-        in_card && $0 ~ /alsa\.card/ && $0 !~ /alsa\.card_name/ {
-            line = $0;
-            gsub(/.*"/, "", line);
-            gsub(/".*/, "", line);
-            if (line ~ /^[0-9]+$/) {
-                print line;
-                exit;
-            }
-        }
-        in_card && $1=="Name:" && $2!=target { exit }
-    ')"
-    if [ -n "$card_num" ]; then
-        echo "$card_num"
-        return 0
-    fi
-
-    pci_bdf="$(card_name_to_pci_bdf "$card_name" || true)"
-    if [ -n "$pci_bdf" ]; then
-        card_num="$(find_alsa_card_number_for_pci_bdf "$pci_bdf" || true)"
-        if [ -n "$card_num" ]; then
-            echo "$card_num"
-            return 0
-        fi
-    fi
-
-    return 1
-}
-
-find_alsa_device_number_for_sink_name() {
-    local sink_name="$1"
-    [ -n "$sink_name" ] || return 1
-    pactl list sinks | awk -v target="$sink_name" '
-        $1=="Name:" && $2==target { in_sink=1; next }
-        in_sink && $0 ~ /alsa\.device/ {
-            line = $0;
-            gsub(/.*"/, "", line);
-            gsub(/".*/, "", line);
-            if (line ~ /^[0-9]+$/) {
-                print line;
-                exit;
-            }
-        }
-        in_sink && $1=="Name:" && $2!=target { exit }
-    '
-}
 
 alsa_card_id_from_number() {
     local card_num="$1"
@@ -698,100 +506,6 @@ apply_iec958_non_audio() {
         return 1
     fi
     return 0
-}
-
-# Dump comprehensive audio system state for debugging.
-# Usage: dump_audio_state "label" "card_num" "hw_device"
-dump_audio_state() {
-    local label="$1"
-    local card_num="${2:-0}"
-    local hw_device="${3:-}"
-    echo ""
-    echo "===== AUDIO STATE DUMP: $label ====="
-    echo "--- Timestamp: $(date '+%H:%M:%S.%N') ---"
-
-    # IEC958 controls (AES0 byte: 0x04=Audio/PCM, 0x06=Non-Audio)
-    echo "--- IEC958 Playback Default (amixer, card $card_num) ---"
-    amixer -c "$card_num" contents 2>/dev/null | awk '
-        /numid=.*IEC958 Playback Default/ { printing=1; print; next }
-        printing && /^ / { print; next }
-        printing { printing=0 }
-    ' || echo "  (amixer not available)"
-
-    # IEC958 Playback Con* (per-connector: on HDA HDMI these override Default)
-    echo "--- IEC958 Playback Con* (amixer, card $card_num) ---"
-    amixer -c "$card_num" contents 2>/dev/null | awk '
-        /numid=.*IEC958 Playback Con/ { printing=1; print; next }
-        printing && /^ / { print; next }
-        printing { printing=0 }
-    ' || echo "  (none found)"
-
-    # ALSA hw_params: what format did the driver actually negotiate?
-    local hw_dev_idx="${hw_device##*,}"
-    if [ -n "$hw_dev_idx" ] && [ -f "/proc/asound/card${card_num}/pcm${hw_dev_idx}p/sub0/hw_params" ]; then
-        echo "--- /proc/asound/card${card_num}/pcm${hw_dev_idx}p/sub0/hw_params ---"
-        cat "/proc/asound/card${card_num}/pcm${hw_dev_idx}p/sub0/hw_params"
-    else
-        echo "--- hw_params: device not open or path not found ---"
-    fi
-
-    # HDMI/DP Jack states
-    echo "--- HDMI/DP Jack states (card $card_num) ---"
-    amixer -c "$card_num" contents 2>/dev/null | awk '
-        /numid=.*HDMI\/DP.*Jack/ { printing=1; print; next }
-        printing && /^ / { print; next }
-        printing { printing=0 }
-    ' || echo "  (amixer not available)"
-
-    # Active card profile
-    echo "--- Active PipeWire card profile ---"
-    pactl list cards short 2>/dev/null | head -5 || echo "  (pactl not available)"
-    if command -v wpctl >/dev/null 2>&1; then
-        wpctl status 2>/dev/null | grep -A2 -i "hdmi\|HDMI" | head -6 || true
-    fi
-
-    # Who holds /dev/snd/* open?
-    echo "--- Processes using /dev/snd/* ---"
-    fuser -v /dev/snd/* 2>&1 || echo "  (no processes or fuser unavailable)"
-
-    # PipeWire sinks
-    echo "--- PipeWire sinks ---"
-    pactl list sinks short 2>/dev/null || echo "  (pactl not available)"
-
-    # PipeWire sink-inputs
-    echo "--- PipeWire sink-inputs ---"
-    pactl list sink-inputs short 2>/dev/null || echo "  (pactl not available)"
-
-    # aplay log tail
-    if [ -f /tmp/aplay.log ]; then
-        echo "--- /tmp/aplay.log (last 10 lines) ---"
-        tail -10 /tmp/aplay.log
-    fi
-
-    # Live PCM stream status (CURRENT hw_ptr / appl_ptr — not the snapshot from -v)
-    local hw_dev_idx2="${hw_device##*,}"
-    if [ -n "$hw_dev_idx2" ] && [ -f "/proc/asound/card${card_num}/pcm${hw_dev_idx2}p/sub0/status" ]; then
-        echo "--- LIVE PCM status (card${card_num}/pcm${hw_dev_idx2}p/sub0/status) ---"
-        cat "/proc/asound/card${card_num}/pcm${hw_dev_idx2}p/sub0/status"
-    fi
-
-    # pw-ac3-live log tail
-    if [ -f /tmp/pw-ac3-live.log ]; then
-        echo "--- /tmp/pw-ac3-live.log (last 10 lines) ---"
-        tail -10 /tmp/pw-ac3-live.log
-    fi
-
-    # ELD status for the specific device
-    echo "--- ELD status (card $card_num) ---"
-    for eld in /proc/asound/card${card_num}/eld#*; do
-        [ -f "$eld" ] || continue
-        local mon=$(grep 'monitor_present' "$eld" 2>/dev/null || true)
-        local valid=$(grep 'eld_valid' "$eld" 2>/dev/null || true)
-        echo "  $(basename $eld): $mon  $valid"
-    done
-
-    echo "===== END AUDIO STATE DUMP: $label ====="
-    echo ""
 }
 
 build_iec958_aplay_device_from_hw() {
@@ -885,188 +599,9 @@ select_direct_alsa_aplay_device() {
     echo "$selected"
 }
 
-find_any_active_hdmi_hw_device_from_eld() {
-    local profile_suffix="$1"
-    local preferred_pin=""
-    local card_dir card_num file pin monitor_present eld_valid dev
 
-    case "$profile_suffix" in
-        *"extra1") preferred_pin="1" ;;
-        *"extra2") preferred_pin="2" ;;
-        *"extra3") preferred_pin="3" ;;
-        *) preferred_pin="" ;;
-    esac
 
-    # First pass: prefer ELD pin matching the requested HDMI extra suffix.
-    if [ -n "$preferred_pin" ]; then
-        for card_dir in /proc/asound/card*; do
-            [ -d "$card_dir" ] || continue
-            card_num="${card_dir##*card}"
-            for file in "$card_dir"/eld#*.*; do
-                [ -f "$file" ] || continue
-                pin="${file##*eld#}"
-                pin="${pin%%.*}"
-                [ "$pin" = "$preferred_pin" ] || continue
-                monitor_present="$(awk '/monitor_present/{print $2; exit}' "$file")"
-                eld_valid="$(awk '/eld_valid/{print $2; exit}' "$file")"
-                if [ "$monitor_present" = "1" ] && [ "$eld_valid" = "1" ]; then
-                    dev="$(hdmi_pin_to_pcm_device_number "$pin" || true)"
-                    if [ -n "$dev" ]; then
-                        echo "${card_num},${dev}"
-                        return 0
-                    fi
-                fi
-            done
-        done
-    fi
 
-    # Second pass: any active/valid ELD across cards.
-    for card_dir in /proc/asound/card*; do
-        [ -d "$card_dir" ] || continue
-        card_num="${card_dir##*card}"
-        for file in "$card_dir"/eld#*.*; do
-            [ -f "$file" ] || continue
-            pin="${file##*eld#}"
-            pin="${pin%%.*}"
-            monitor_present="$(awk '/monitor_present/{print $2; exit}' "$file")"
-            eld_valid="$(awk '/eld_valid/{print $2; exit}' "$file")"
-            if [ "$monitor_present" = "1" ] && [ "$eld_valid" = "1" ]; then
-                dev="$(hdmi_pin_to_pcm_device_number "$pin" || true)"
-                if [ -n "$dev" ]; then
-                    echo "${card_num},${dev}"
-                    return 0
-                fi
-            fi
-        done
-    done
-
-    return 1
-}
-
-log_eld_probe_status() {
-    local file pin monitor_present eld_valid
-    for file in /proc/asound/card*/eld#*.*; do
-        [ -f "$file" ] || continue
-        pin="${file##*eld#}"
-        pin="${pin%%.*}"
-        monitor_present="$(awk '/monitor_present/{print $2; exit}' "$file")"
-        eld_valid="$(awk '/eld_valid/{print $2; exit}' "$file")"
-        echo "Info: ELD probe ${file} pin=${pin} monitor_present=${monitor_present:-?} eld_valid=${eld_valid:-?}" >&2
-    done
-}
-
-resolve_direct_alsa_hw_device() {
-    local sink_name="$1"
-    local card_name="$2"
-    local profile_suffix="$3"
-
-    if [ -n "$DIRECT_ALSA_DEVICE_OVERRIDE" ]; then
-        echo "Info: PW_AC3_DIRECT_ALSA_DEVICE override is set ('$DIRECT_ALSA_DEVICE_OVERRIDE'); skipping ELD/sink auto-detection." >&2
-        echo "$DIRECT_ALSA_DEVICE_OVERRIDE"
-        return 0
-    fi
-
-    local alsa_card_num=""
-    local alsa_device_num=""
-    local preferred_profile_device=""
-    local global_eld_pair=""
-    local global_eld_card=""
-    local global_eld_device=""
-
-    alsa_card_num="$(find_alsa_card_number_for_card_name "$card_name" || true)"
-    if [ -n "$alsa_card_num" ]; then
-        echo "Info: Resolved ALSA card number '$alsa_card_num' for '$card_name'." >&2
-    fi
-
-    preferred_profile_device="$(profile_suffix_to_alsa_device_number "$profile_suffix")"
-
-    if [ -n "$alsa_card_num" ]; then
-        alsa_device_num="$(find_active_hdmi_device_from_eld "$alsa_card_num" "$profile_suffix" || true)"
-        if [ -n "$alsa_device_num" ]; then
-            echo "Info: Selected ALSA device from card-local ELD monitor detection (${alsa_device_num})." >&2
-        else
-            echo "Warning: No active HDMI ELD monitor detected on ALSA card $alsa_card_num." >&2
-        fi
-    fi
-
-    if [ -z "$alsa_device_num" ]; then
-        alsa_device_num="$(find_alsa_device_number_for_sink_name "$sink_name" || true)"
-        if [ -n "$alsa_device_num" ]; then
-            echo "Info: Selected ALSA device from sink metadata ($alsa_device_num)." >&2
-        fi
-    fi
-
-    if [ -z "$alsa_device_num" ] && [ -n "$preferred_profile_device" ]; then
-        alsa_device_num="$preferred_profile_device"
-        echo "Info: Could not resolve ALSA device from ELD/sink metadata; using profile-based fallback ($alsa_device_num)." >&2
-    fi
-
-    if [ -z "$alsa_card_num" ] || [ -z "$alsa_device_num" ]; then
-        global_eld_pair="$(find_any_active_hdmi_hw_device_from_eld "$profile_suffix" || true)"
-        if [ -n "$global_eld_pair" ]; then
-            global_eld_card="${global_eld_pair%%,*}"
-            global_eld_device="${global_eld_pair##*,}"
-            [ -n "$alsa_card_num" ] || alsa_card_num="$global_eld_card"
-            [ -n "$alsa_device_num" ] || alsa_device_num="$global_eld_device"
-            echo "Info: Selected ALSA hw device from global ELD scan (card=${global_eld_card}, device=${global_eld_device})." >&2
-        else
-            echo "Warning: No active HDMI ELD found in global scan." >&2
-            log_eld_probe_status
-        fi
-    fi
-
-    if [ -z "$alsa_card_num" ]; then
-        echo "Warning: Could not resolve ALSA card number for '$card_name'; defaulting to card 0." >&2
-        echo "Hint: set PW_AC3_DIRECT_ALSA_DEVICE=hw:<card>,<device> to override." >&2
-        alsa_card_num="0"
-    fi
-
-    if [ -z "$alsa_device_num" ]; then
-        alsa_device_num="$preferred_profile_device"
-        echo "Info: Could not resolve ALSA device number from all sources; using profile-based fallback ($alsa_device_num)." >&2
-    fi
-
-    if [ -n "$preferred_profile_device" ] && [ "$alsa_device_num" != "$preferred_profile_device" ]; then
-        echo "Warning: Resolved ALSA device (${alsa_device_num}) does not match profile-derived device (${preferred_profile_device}) for '${profile_suffix}'." >&2
-        echo "Hint: if silent, try PW_AC3_DIRECT_ALSA_DEVICE=hw:${alsa_card_num},${preferred_profile_device}" >&2
-        if [ "$DIRECT_ALSA_FORCE_PROFILE_DEVICE" = "1" ]; then
-            echo "Info: Forcing direct ALSA device to profile-derived device (${preferred_profile_device}) because PW_AC3_DIRECT_ALSA_FORCE_PROFILE_DEVICE=1." >&2
-            alsa_device_num="$preferred_profile_device"
-        fi
-    fi
-
-    echo "hw:${alsa_card_num},${alsa_device_num}"
-}
-
-find_best_hdmi_sink_line() {
-    pactl list sinks short | awk '
-        BEGIN { best_score = -100000 }
-        $2 ~ /hdmi/ {
-            name = $2
-            score = 0
-
-            if (name ~ /^alsa_output\./) score += 100
-            if (name ~ /pci-/) score += 20
-            if (name ~ /hdmi-stereo/) score += 10
-            if ($NF == "RUNNING") score += 5
-
-            if (name ~ /^alsa_loopback_device\./) score -= 300
-            if (name ~ /loopback/) score -= 300
-            if (name ~ /pw-ac3-live/) score -= 300
-            if (name ~ /monitor/) score -= 150
-
-            if (score > best_score) {
-                best_score = score
-                best_line = $0
-            }
-        }
-        END {
-            if (best_line != "") {
-                print best_line
-            }
-        }
-    '
-}
 
 # 0. Cleanup previous runs
 echo "Stopping any existing instances..."
@@ -1080,47 +615,29 @@ if [ -n "$ORIGINAL_DEFAULT_SINK" ]; then
   echo "Original default sink: $ORIGINAL_DEFAULT_SINK"
 fi
 # 1. Detect HDMI sink (prefer physical ALSA output; allow manual override)
-echo "Finding HDMI sink..."
-if [ -n "$TARGET_SINK_OVERRIDE" ]; then
-  echo "Using PW_AC3_TARGET_SINK override: $TARGET_SINK_OVERRIDE"
-  HDMI_LINE=$(pactl list sinks short | awk -v sink="$TARGET_SINK_OVERRIDE" '$2==sink {print; exit}')
-else
-  HDMI_LINE=$(find_best_hdmi_sink_line)
+# 1. Hardcoded Loopback Sink Detection
+echo "Using hardcoded loopback sink: alsa_loopback_device.alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2"
+SINK_NAME="alsa_loopback_device.alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2"
+SINK_INDEX=$(pactl list sinks short | grep "$SINK_NAME" | awk '{print $1}')
+
+if [ -z "$SINK_INDEX" ]; then
+    echo "Warning: Hardcoded sink '$SINK_NAME' not found in pactl list."
 fi
 
-if [ -z "$HDMI_LINE" ]; then
-  echo "Error: No HDMI sink found."
-  pactl list sinks short
-  exit 1
-fi
+LOOPBACK_FALLBACK_TARGET="$SINK_NAME"
+# Assume we are always on loopback for this simplified script
+echo "Loopback detected (hardcoded assumption)."
 
-SINK_INDEX=$(echo "$HDMI_LINE" | awk '{print $1}')
-SINK_NAME=$(echo "$HDMI_LINE"  | awk '{print $2}')
-CONNECT_TARGET_PATTERN="$SINK_NAME"
+# Set variables that were previously derived
 APP_TARGET_NAME="$SINK_NAME"
-LOOPBACK_FALLBACK_TARGET=""
-echo "Selected Sink: $SINK_NAME (Index: $SINK_INDEX)"
+CONNECT_TARGET_PATTERN="$SINK_NAME"
+CARD_NAME="alsa_card.pci-0000_04_00.1"
+PROFILE_SUFFIX="hdmi-stereo-extra2"
+PROFILE_NAME="output:hdmi-stereo-extra2"
+# Always restore to the HDMI loopback sink, regardless of what was active at launch.
+# This prevents a bad-state cascade where a previous failed restore leaves the wrong sink recorded.
+ORIGINAL_DEFAULT_SINK="$SINK_NAME"
 
-if echo "$SINK_NAME" | grep -q "loopback"; then
-  LOOPBACK_FALLBACK_TARGET="$SINK_NAME"
-  LOOPBACK_BACKING_SINK="${SINK_NAME#alsa_loopback_device.}"
-  CONNECT_TARGET_PATTERN="$LOOPBACK_BACKING_SINK"
-  if [ -z "$TARGET_SINK_OVERRIDE" ]; then
-    PHYSICAL_LINE=$(pactl list sinks short | awk -v n="$LOOPBACK_BACKING_SINK" '$2==n {print; exit}')
-    if [ -n "$PHYSICAL_LINE" ]; then
-      SINK_INDEX=$(echo "$PHYSICAL_LINE" | awk '{print $1}')
-      SINK_NAME=$(echo "$PHYSICAL_LINE"  | awk '{print $2}')
-      CONNECT_TARGET_PATTERN="$SINK_NAME"
-      echo "Loopback sink detected. Switching to physical sink: $SINK_NAME (Index: $SINK_INDEX)"
-    else
-      AUTO_APP_TARGET_FROM_CONNECT=0
-      echo "Loopback sink detected and no physical sink entry found in pactl."
-      echo "Will keep loopback as stream target and try backing pattern for port links: $CONNECT_TARGET_PATTERN"
-    fi
-  else
-    echo "Warning: Override sink appears loopback-based. Passthrough may be choppy/silent."
-  fi
-fi
 
 if [ -n "$CONNECT_TARGET_OVERRIDE" ]; then
   CONNECT_TARGET_PATTERN="$CONNECT_TARGET_OVERRIDE"
@@ -1229,79 +746,28 @@ if [ -n "$CARD_NAME" ]; then
   fi
 fi
 
-# 3b. If we were on a loopback, check if the physical sink appeared after profile switch
-# 3b. If we were on a loopback, check if the physical sink appeared after profile switch
+# 3b. If we were on a loopback, assume physical sink is hidden/busy and fallback to Direct ALSA.
 if [ -n "$LOOPBACK_FALLBACK_TARGET" ]; then
-  echo "Re-checking for physical HDMI sink after profile update..."
-  NEW_HDMI_LINE=$(find_best_hdmi_sink_line)
+  echo "Using Direct ALSA Sink takeover (Hardcoded defaults)..."
+
+  DIRECT_ALSA_DEVICE="hw:0,8"
+  echo "Hardcoded direct ALSA device: '$DIRECT_ALSA_DEVICE'"
   
-  # Determine if we found a VALID physical sink (not loopback)
-  FOUND_PHYSICAL_SINK=0
-  if [ -n "$NEW_HDMI_LINE" ]; then
-      NEW_SINK_NAME=$(echo "$NEW_HDMI_LINE" | awk '{print $2}')
-      if ! echo "$NEW_SINK_NAME" | grep -q "loopback"; then
-          FOUND_PHYSICAL_SINK=1
-      fi
-  fi
-
-  if [ "$FOUND_PHYSICAL_SINK" -eq 1 ]; then
-      # CASE 1: Success - Physical sink appeared
-      echo "Found physical sink: $NEW_SINK_NAME. Switching away from loopback."
-      SINK_INDEX=$(echo "$NEW_HDMI_LINE" | awk '{print $1}')
-      SINK_NAME="$NEW_SINK_NAME"
-      APP_TARGET_NAME="$SINK_NAME"
-      CONNECT_TARGET_PATTERN="$SINK_NAME"
-      LOOPBACK_FALLBACK_TARGET=""
-      AUTO_APP_TARGET_FROM_CONNECT=1
-
-
+  # 1. Checking profile - ASSUMING DISABLE_PROFILE=0 (Keeping profile active)
+  echo "Keeping card profile '$PROFILE_NAME' active for direct ALSA playback (PW_AC3_DIRECT_ALSA_DISABLE_PROFILE=0)."
+  
+  # 2. Use aplay directly (bypass Pulse/PipeWire sink)
+  if command -v aplay >/dev/null 2>&1; then
+      echo "Using direct 'aplay' to hardware device: $DIRECT_ALSA_DEVICE"
+      USE_DIRECT_APLAY=1
+      EXPLICIT_ALSA_DEVICE="$DIRECT_ALSA_DEVICE"
+      
+      # Update cleanup trap to restore profile
+      trap 'run_cleanup_once "Cleaning up..."; exit' INT TERM EXIT
   else
-      if [ "$DIRECT_ALSA_FALLBACK" = "1" ]; then
-          # CASE 3: Failure - Physical sink hidden/busy. Optional direct ALSA fallback.
-          echo "Loopback detected and physical sink is hidden/busy. Attempting Direct ALSA Sink takeover (PW_AC3_DIRECT_ALSA_FALLBACK=1)..."
-
-          DIRECT_ALSA_DEVICE="$(resolve_direct_alsa_hw_device "$SINK_NAME" "$CARD_NAME" "$PROFILE_SUFFIX")"
-          DIRECT_ALSA_CARD_NUM="${DIRECT_ALSA_DEVICE#hw:}"
-          DIRECT_ALSA_CARD_NUM="${DIRECT_ALSA_CARD_NUM%%,*}"
-          echo "Resolved direct ALSA device: '$DIRECT_ALSA_DEVICE' (profile '$PROFILE_SUFFIX')"
-          if [ -n "$DIRECT_ALSA_DEVICE_OVERRIDE" ]; then
-              echo "Using PW_AC3_DIRECT_ALSA_DEVICE override."
-          fi
-          
-          # 1. Optionally disable profile to free the device.
-          # Keeping the HDMI profile active tends to preserve output routing on some setups.
-          if [ "$DIRECT_ALSA_DISABLE_PROFILE" = "1" ]; then
-              echo "Disabling card profile '$PROFILE_NAME' to free hardware device (PW_AC3_DIRECT_ALSA_DISABLE_PROFILE=1)..."
-              if [ -z "$RESTORE_PROFILE" ] && [ -n "$PROFILE_NAME" ]; then
-                  RESTORE_PROFILE="$PROFILE_NAME"
-              fi
-              if [ -n "$RESTORE_PROFILE" ]; then
-                  echo "Card profile will be restored to '$RESTORE_PROFILE' on exit."
-              fi
-              pactl set-card-profile "$CARD_NAME" off
-              sleep 2
-          else
-              echo "Keeping card profile '$PROFILE_NAME' active for direct ALSA playback (PW_AC3_DIRECT_ALSA_DISABLE_PROFILE=0)."
-          fi
-          
-          # 2. Use aplay directly (bypass Pulse/PipeWire sink)
-          if command -v aplay >/dev/null 2>&1; then
-              echo "Using direct 'aplay' to hardware device: $DIRECT_ALSA_DEVICE"
-              USE_DIRECT_APLAY=1
-              EXPLICIT_ALSA_DEVICE="$DIRECT_ALSA_DEVICE"
-              
-              # Update cleanup trap to restore profile
-              trap 'run_cleanup_once "Cleaning up..."; exit' INT TERM EXIT
-          else
-              echo "Error: 'aplay' not found. Cannot proceed with direct ALSA takeover."
-              restore_runtime_audio_state
-              exit 1
-          fi
-      else
-          echo "Loopback detected and physical sink is hidden/busy."
-          echo "Keeping PipeWire loopback path (PW_AC3_DIRECT_ALSA_FALLBACK=0)."
-          echo "Set PW_AC3_DIRECT_ALSA_FALLBACK=1 to force direct ALSA fallback."
-      fi
+      echo "Error: 'aplay' not found. Cannot proceed with direct ALSA takeover."
+      restore_runtime_audio_state
+      exit 1
   fi
 fi
 
@@ -1341,29 +807,11 @@ if [ -n "$LOOPBACK_FALLBACK_TARGET" ] && [ "$USE_DIRECT_APLAY" != "1" ]; then
 fi
 
 case "$PLAYBACK_MODE" in
-    native|stdout)
+    native)
         ;;
     *)
         echo "Warning: Unsupported PW_AC3_PLAYBACK_MODE='$PLAYBACK_MODE'. Falling back to 'native'."
         PLAYBACK_MODE="native"
-        ;;
-esac
-
-case "$SHOW_RUNTIME_LOGS" in
-    0|1)
-        ;;
-    *)
-        echo "Warning: Unsupported PW_AC3_SHOW_RUNTIME_LOGS='$SHOW_RUNTIME_LOGS'. Falling back to 0."
-        SHOW_RUNTIME_LOGS=0
-        ;;
-esac
-
-case "$DIRECT_ALSA_FALLBACK" in
-    0|1)
-        ;;
-    *)
-        echo "Warning: Unsupported PW_AC3_DIRECT_ALSA_FALLBACK='$DIRECT_ALSA_FALLBACK'. Falling back to 0."
-        DIRECT_ALSA_FALLBACK=0
         ;;
 esac
 
@@ -1374,11 +822,6 @@ fi
 
 # 5. Launch Application
 echo "Launching pw-ac3-live..."
-PROFILE_LATENCY_ARGS=()
-if [ "$ENABLE_LATENCY_PROFILE" = "1" ]; then
-    echo "Latency profiling enabled."
-    PROFILE_LATENCY_ARGS+=(--profile-latency)
-fi
 
 OUTPUT_BUFFER_ARGS=()
 echo "Using effective buffers: input=${effective_buffer_size} output=${effective_output_buffer_size} frames"
@@ -1417,27 +860,19 @@ else
     APP_CMD+=(cargo run --release --)
 fi
 
-    PASSTHROUGH_ARGS=()
-    if [ "${PW_AC3_PASSTHROUGH:-0}" = "1" ]; then
-        echo "WARNING: Enabling passthrough mode (No Encoding)."
-        PASSTHROUGH_ARGS=(--passthrough)
-    fi
-
 COMMON_ARGS=(
     --buffer-size "$effective_buffer_size"
     --latency "$LOW_LATENCY_NODE_LATENCY"
     --ffmpeg-thread-queue-size "$LOW_LATENCY_THREAD_QUEUE"
     --ffmpeg-chunk-frames "$LOW_LATENCY_CHUNK_FRAMES"
     "${OUTPUT_BUFFER_ARGS[@]}"
-    "${PROFILE_LATENCY_ARGS[@]}"
-    "${PASSTHROUGH_ARGS[@]}"
 )
 
 if [ "$USE_DIRECT_APLAY" = "1" ]; then
     # Direct ALSA Playback (Exclusive Mode)
     PRODUCER_CMD=("${APP_CMD[@]}" --target "" --stdout "${COMMON_ARGS[@]}")
     DIRECT_ALSA_APLAY_DEVICE="$(select_direct_alsa_aplay_device "$EXPLICIT_ALSA_DEVICE")"
-    DIRECT_ALSA_USED_PROFILE_OFF_RETRY=0
+
     DIRECT_ALSA_HW_FALLBACK_DEVICE="$EXPLICIT_ALSA_DEVICE"
     if [ "${PW_AC3_DIRECT_ALSA_USE_PLUG:-0}" = "1" ] && [[ "$DIRECT_ALSA_HW_FALLBACK_DEVICE" == hw:* ]]; then
         DIRECT_ALSA_HW_FALLBACK_DEVICE="plughw:${DIRECT_ALSA_HW_FALLBACK_DEVICE#hw:}"
@@ -1456,13 +891,7 @@ if [ "$USE_DIRECT_APLAY" = "1" ]; then
             for IEC958_CTL in 'IEC958,1' 'IEC958,2' 'IEC958,3'; do
                 amixer -c "$ALSA_CARD_INDEX" set "$IEC958_CTL" unmute >/dev/null 2>&1 || true
             done
-            if [ "$SHOW_RUNTIME_LOGS" = "1" ]; then
-                echo "ALSA IEC958 switch state (post-unmute):"
-                amixer -c "$ALSA_CARD_INDEX" scontents 2>/dev/null | awk '
-                    /^Simple mixer control / { current_ctrl = ($0 ~ /IEC958/ ? 1 : 0); if (current_ctrl) print; next }
-                    current_ctrl && /Playback Switch/ { print }
-                ' || true
-            fi
+
         fi
 
     # ====================================================================
@@ -1482,14 +911,11 @@ if [ "$USE_DIRECT_APLAY" = "1" ]; then
 
     # Step 1: Disable the card profile to release the ALSA device and
     #         the IEC958 control lock.
-    if [ "$DIRECT_ALSA_DISABLE_PROFILE" != "1" ] && [ -n "$CARD_NAME" ] && [ -n "$PROFILE_NAME" ]; then
-        echo "Disabling card profile '${PROFILE_NAME}' to release ALSA device and IEC958 lock..."
-        if [ -z "$RESTORE_PROFILE" ]; then
-            RESTORE_PROFILE="$PROFILE_NAME"
-        fi
+    if [ -n "$CARD_NAME" ]; then
+        echo "Disabling card profile '$PROFILE_NAME' to release ALSA device and IEC958 lock..."
         pactl set-card-profile "$CARD_NAME" off >/dev/null 2>&1 || true
-        DIRECT_ALSA_USED_PROFILE_OFF_RETRY=1
     fi
+
 
     # Step 2: Wait for PipeWire to asynchronously release /dev/snd/*
     echo "Waiting for PipeWire to release device..."
@@ -1512,15 +938,11 @@ if [ "$USE_DIRECT_APLAY" = "1" ]; then
     : > /tmp/aplay.log 2>/dev/null || true
     : > /tmp/pw-ac3-live.log 2>/dev/null || true
 
-    dump_audio_state "AFTER-PROFILE-OFF-DEVICE-FREE" "$ALSA_CARD_INDEX_DIAG" "$EXPLICIT_ALSA_DEVICE"
-
     # Step 3: Apply IEC958 Non-Audio (now that the lock is released)
     apply_iec958_non_audio "$EXPLICIT_ALSA_DEVICE" "$DIRECT_ALSA_SKIP_IECSET"
-    dump_audio_state "AFTER-IECSET" "$ALSA_CARD_INDEX_DIAG" "$EXPLICIT_ALSA_DEVICE"
 
     # Step 4: Launch aplay
     if ! launch_direct_aplay_pipeline PRODUCER_CMD "$DIRECT_ALSA_APLAY_DEVICE"; then
-        dump_audio_state "APLAY-OPEN-FAILED" "$ALSA_CARD_INDEX_DIAG" "$EXPLICIT_ALSA_DEVICE"
         if [ "$DIRECT_ALSA_APLAY_DEVICE" != "$DIRECT_ALSA_HW_FALLBACK_DEVICE" ]; then
             echo "Warning: aplay failed to open '$DIRECT_ALSA_APLAY_DEVICE'; retrying with fallback '$DIRECT_ALSA_HW_FALLBACK_DEVICE'."
             kill "$APP_PID" >/dev/null 2>&1 || true
@@ -1544,17 +966,8 @@ if [ "$USE_DIRECT_APLAY" = "1" ]; then
             exit 1
         fi
     fi
-    dump_audio_state "APLAY-LAUNCHED" "$ALSA_CARD_INDEX_DIAG" "$EXPLICIT_ALSA_DEVICE"
 
-    if [ "$DIRECT_ALSA_USED_PROFILE_OFF_RETRY" = "1" ] && [ "$DIRECT_ALSA_RESTORE_PROFILE_AFTER_OPEN" = "1" ] && [ -n "$CARD_NAME" ] && [ -n "$PROFILE_NAME" ]; then
-        echo "Re-applying HDMI card profile '$PROFILE_NAME' now that direct ALSA stream is open..."
-        if pactl set-card-profile "$CARD_NAME" "$PROFILE_NAME" >/dev/null 2>&1; then
-            echo "Re-applied card profile: $PROFILE_NAME"
-        else
-            echo "Warning: Failed to re-apply card profile '$PROFILE_NAME' after direct ALSA open."
-        fi
-        sleep 1
-    fi
+
 
     # (IEC958 Non-Audio is now configured BEFORE aplay launch — see above)
 elif [ "$PLAYBACK_MODE" = "stdout" ]; then
@@ -1593,61 +1006,13 @@ elif [ "$PLAYBACK_MODE" = "stdout" ]; then
     APP_PID=$!
 else
     # Native mode: let pw-ac3-live create and manage its PipeWire playback stream.
-    NATIVE_CMD=("${APP_CMD[@]}" --target "$APP_TARGET_NAME" "${COMMON_ARGS[@]}")
-    echo "Using native PipeWire playback mode (target: $APP_TARGET_NAME)."
-    if [ "$SHOW_RUNTIME_LOGS" = "1" ]; then
-        (
-            "${NATIVE_CMD[@]}" 2>&1 | tee /tmp/pw-ac3-live.log
-        ) &
-    else
-        "${NATIVE_CMD[@]}" > /tmp/pw-ac3-live.log 2>&1 &
-    fi
+    "${NATIVE_CMD[@]}" > /tmp/pw-ac3-live.log 2>&1 &
     APP_PID=$!
 fi
 
 echo "Pipeline launched with PID $APP_PID (pw-ac3-live log: /tmp/pw-ac3-live.log)"
     
-    # DEBUG: Check if process is running
-    echo "DEBUG: Checking if PID $APP_PID is running..."
-    if ps -p "$APP_PID" > /dev/null; then
-        echo "DEBUG: Process $APP_PID is running."
-    else
-        echo "DEBUG: Process $APP_PID is NOT running immediately after launch!"
-    fi
-
-    # Update cleanup trap to debug
-    trap 'run_cleanup_once "DEBUG: Trap triggered at $(date). Cleaning up..."; exit' INT TERM EXIT
-
-    monitor_stats() {
-        echo "Starting stats monitor..."
-        while kill -0 "$APP_PID" 2>/dev/null; do
-            # Monitor aplay delay if available
-            if [ -n "$DIRECT_ALSA_HW_FALLBACK_DEVICE" ] || [ -n "$DIRECT_ALSA_APLAY_DEVICE" ]; then
-                local dev="${DIRECT_ALSA_APLAY_DEVICE:-$DIRECT_ALSA_HW_FALLBACK_DEVICE}"
-                local card="${dev#hw:}"
-                card="${card%%,*}"
-                local device="${dev##*,}"
-                local status_file="/proc/asound/card${card}/pcm${device}p/sub0/status"
-                if [ -f "$status_file" ]; then
-                    local delay=$(grep "delay" "$status_file" | awk '{print $3}')
-                    local avail=$(grep "avail" "$status_file" | awk '{print $3}')
-                    if [ -n "$delay" ]; then
-                        echo "STATS: aplay delay=${delay} frames ($((delay * 1000 / 48000)) ms) avail=${avail}"
-                    fi
-                fi
-            fi
-            
-            # Monitor pw-ac3-live latency logs
-            if [ -f "/tmp/pw-ac3-live.log" ]; then
-                tail -n 20 /tmp/pw-ac3-live.log | grep "latency" | tail -n 1
-            fi
-            
-            sleep 1
-        done
-    }
-
-    # Launch stats monitor in background
-    monitor_stats &
+    trap 'run_cleanup_once; exit' INT TERM EXIT
 
 # 6. Wait for Nodes
 echo "Waiting for pw-ac3-live-input node to appear..."
@@ -1735,15 +1100,12 @@ fi
 # 9. Enforce bitstream-safe runtime levels after graph creation
 normalize_pw_ac3_live_levels
 
-if [ "$USE_DIRECT_APLAY" = "1" ] || [ "$PLAYBACK_MODE" = "stdout" ]; then
+if [ "$USE_DIRECT_APLAY" = "1" ]; then
     check_graph_health ""
 else
     check_graph_health "${PRIMARY_LINK_TARGET:-$APP_TARGET_NAME}"
 fi
 
-echo "========================================"
-ALSA_CARD_INDEX_DIAG="${ALSA_CARD_INDEX_DIAG:-0}"
-dump_audio_state "FINAL-LAUNCH-STATE" "$ALSA_CARD_INDEX_DIAG" "${EXPLICIT_ALSA_DEVICE:-}"
 echo "LAUNCH SUCCESSFUL"
 echo "pw-ac3-live is running. Press SINK VOLUME warning: Ensure your physical receiver volume is strictly controlled!"
 echo "Main logs are above. Press Ctrl+C to stop everything."
@@ -1758,27 +1120,6 @@ EXIT_CODE=$?
 
 if [ "$EXIT_CODE" -ne 0 ]; then
     echo "Error: Pipeline exited with code $EXIT_CODE"
-fi
-
-if [ -f "/tmp/pacat.log" ]; then
-    # Only print pacat log if it exists and has errors (optional)
-    :
-fi
-if [ -f "/tmp/pw-play.log" ]; then
-    echo "=== pw-play log (/tmp/pw-play.log) ==="
-    cat "/tmp/pw-play.log"
-    echo "=================================="
-fi
-if [ -f "/tmp/pw-ac3-live.log" ]; then
-    echo "=== pw-ac3-live log (/tmp/pw-ac3-live.log) ==="
-    cat "/tmp/pw-ac3-live.log"
-    echo "=================================="
-fi
-# ALWAYS print aplay log for debugging
-if [ -f "/tmp/aplay.log" ]; then
-    echo "=== aplay log (/tmp/aplay.log) ==="
-    cat "/tmp/aplay.log"
-    echo "=================================="
 fi
 
 exit $EXIT_CODE
