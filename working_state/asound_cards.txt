@@ -1,0 +1,5 @@
+ 0 [Generic        ]: HDA-Intel - HD-Audio Generic
+                      HD-Audio Generic at 0x805c0000 irq 68
+ 1 [sofnau8821max  ]: sof-nau8821-max - sof-nau8821-max
+                      Valve-Galileo-1
+Connection to 192.168.0.129 closed.

@@ -1,0 +1,4 @@
+232	alsa_loopback_device.alsa_output.pci-0000_04_00.5-platform-nau8821-max.HiFi__Speaker__sink	PipeWire	float32le 2ch 48000Hz	IDLE
+234	alsa_loopback_device.alsa_output.pci-0000_04_00.5-platform-nau8821-max.HiFi__Headphones__sink	PipeWire	float32le 2ch 48000Hz	IDLE
+789	pw-ac3-live-input	PipeWire	float32le 6ch 48000Hz	RUNNING
+Connection to 192.168.0.129 closed.

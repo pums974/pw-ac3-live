@@ -38,11 +38,10 @@ fi
 
 echo "==> Staging package at ${PKG_DIR}"
 rm -rf "${PKG_DIR}"
-mkdir -p "${PKG_DIR}/bin" "${PKG_DIR}/scripts"
+mkdir -p "${PKG_DIR}/bin"
 
 cp "${BIN_PATH}" "${PKG_DIR}/bin/${APP_NAME}"
-cp "${REPO_ROOT}/scripts/launch_live.sh" "${PKG_DIR}/scripts/launch_live.sh"
-cp "${REPO_ROOT}/scripts/connect.sh" "${PKG_DIR}/scripts/connect.sh"
+cp -r "${REPO_ROOT}/scripts" "${PKG_DIR}/"
 cp "${REPO_ROOT}/README.md" "${PKG_DIR}/README.md"
 
 cat > "${PKG_DIR}/run.sh" <<'EOF'

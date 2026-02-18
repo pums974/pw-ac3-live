@@ -69,7 +69,31 @@ PW_AC3_OUTPUT_BUFFER_SIZE=960 ./scripts/launch_live.sh
 
 # Optional: force a specific physical HDMI sink node
 PW_AC3_TARGET_SINK=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 ./scripts/launch_live.sh
+
+# Optional (loopback-only setups): force app target and link target separately
+PW_AC3_APP_TARGET=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 \
+PW_AC3_CONNECT_TARGET=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 \
+./scripts/launch_live.sh
+
+# Optional: use legacy stdout->pw-play pipeline instead of native PipeWire playback
+PW_AC3_PLAYBACK_MODE=stdout ./scripts/launch_live.sh
+
+# Optional: force direct ALSA fallback when loopback-only sinks are detected
+PW_AC3_DIRECT_ALSA_FALLBACK=1 ./scripts/launch_live.sh
 ```
+
+`launch_live.sh` now defaults to a stability-first profile on Steam Deck:
+- Playback path defaults to native PipeWire mode (`PW_AC3_PLAYBACK_MODE=native`).
+- Direct ALSA fallback is opt-in (`PW_AC3_DIRECT_ALSA_FALLBACK=0` by default).
+- `PW_AC3_NODE_LATENCY=1536/48000` (aligns with AC-3 frame cadence)
+- `PW_AC3_BUFFER_SIZE=6144`
+- `PW_AC3_OUTPUT_BUFFER_SIZE=8192`
+- `PW_AC3_FFMPEG_CHUNK_FRAMES=1536`
+- Input/output buffers are auto-clamped to at least `4x` node latency frames to avoid dropouts.
+- In loopback-only mode, output buffer is auto-raised to `12288` unless `PW_AC3_OUTPUT_BUFFER_SIZE` is explicitly set.
+- If a loopback sink (`alsa_loopback_device...`) is auto-detected, the launcher now switches to the matching physical sink (`alsa_output...`) automatically or fails with a clear error.
+- If only a loopback sink exists, the launcher keeps it as the stream target but attempts port linking via the backing pattern (`alsa_output...`) when available.
+- For strict routing, `connect.sh` now requires exact node-name match by default (substring fallback is disabled unless `PW_AC3_CONNECT_ALLOW_FALLBACK=1`).
 
 ## Fresh Start (Recommended)
 Use this section if you want to reset your setup and start from zero.
@@ -178,6 +202,7 @@ If the second pattern is missing, link manually:
 
 > [!WARNING]
 > **Exclusive Access**: Ensure no other applications (browsers, music players) are playing directly to the HDMI sink. They must play to `AC-3 Encoder Input`. Mixed PCM + AC-3 payload will cause artifacts or silence. Use `pw-link -d` to unlink rogue streams from the HDMI sink.
+> `scripts/connect.sh` now enforces this automatically (`PW_AC3_EXCLUSIVE_HDMI=1` by default). Set `PW_AC3_EXCLUSIVE_HDMI=0` to disable.
 
 ### 9) Receiver/TV audio mode
 On AVR/TV, HDMI audio mode must allow compressed bitstream (`Bitstream`, `Auto`, passthrough).
@@ -232,22 +257,23 @@ pw-link -l
 ### Audio is laggy and choppy (Steam Deck)
 Try this balanced launcher profile first:
 ```bash
-PW_AC3_BUFFER_SIZE=480 \
-PW_AC3_OUTPUT_BUFFER_SIZE=960 \
-PW_AC3_NODE_LATENCY=32/48000 \
+PW_AC3_BUFFER_SIZE=3072 \
+PW_AC3_OUTPUT_BUFFER_SIZE=6144 \
+PW_AC3_NODE_LATENCY=1536/48000 \
 PW_AC3_FFMPEG_THREAD_QUEUE_SIZE=32 \
-PW_AC3_FFMPEG_CHUNK_FRAMES=128 \
+PW_AC3_FFMPEG_CHUNK_FRAMES=1536 \
 ./scripts/launch_live.sh
 ```
 
 If audio is still choppy, increase only output buffering:
 ```bash
-PW_AC3_OUTPUT_BUFFER_SIZE=1920 ./scripts/launch_live.sh
+PW_AC3_OUTPUT_BUFFER_SIZE=8192 ./scripts/launch_live.sh
 ```
 
 Notes:
 - `launch_live.sh` now moves existing sink-input streams to `pw-ac3-live-input`, so apps started before the script are less likely to corrupt HDMI AC-3 passthrough.
 - `latency[pipewire] playback.underruns` should remain near zero; if it climbs quickly, increase `PW_AC3_OUTPUT_BUFFER_SIZE`.
+- If `playback.queue_delay_ms` stays near ~20 ms with frequent underruns, keep `PW_AC3_NODE_LATENCY=1536/48000` and increase only `PW_AC3_OUTPUT_BUFFER_SIZE` (`8192`, then `12288`).
 
 ### Audio drops or glitches
 Increase ring buffer size:

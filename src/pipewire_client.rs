@@ -170,6 +170,7 @@ fn resolve_playback_target(target_node: Option<&str>) -> PlaybackTarget {
 }
 
 fn build_playback_properties(target: &PlaybackTarget) -> pw::properties::Properties {
+    let has_explicit_target = target.target_object.is_some() || target.connect_target_id.is_some();
     let mut playback_props = properties! {
         *pw::keys::NODE_NAME => "pw-ac3-live-output",
         *pw::keys::NODE_DESCRIPTION => "AC-3 Live Output",
@@ -181,7 +182,15 @@ fn build_playback_properties(target: &PlaybackTarget) -> pw::properties::Propert
         "media.name" => "ac3-encoder-playback",
         "stream.is-live" => "true",
         "node.want-driver" => "true",
-        "node.autoconnect" => "true",
+        // We link explicitly from the launcher/script to avoid accidental mixed routes.
+        "node.autoconnect" => if has_explicit_target { "false" } else { "true" },
+        // Keep IEC61937 bytes bit-transparent: no remix, no resample, no dither.
+        "stream.dont-remix" => "true",
+        "channelmix.disable" => "true",
+        "channelmix.normalize" => "false",
+        "resample.disable" => "true",
+        "dither.method" => "none",
+        "session.suspend-timeout-seconds" => "0",
     };
 
     if let Some(target_object) = target.target_object.as_deref() {
@@ -395,6 +404,11 @@ pub fn run_pipewire_loop_with_config(
         config.node_latency.as_str()
     };
     let profile_latency = config.profile_latency;
+    let requested_latency_frames = node_latency
+        .split('/')
+        .next()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|frames| *frames > 0);
     let profiler = profile_latency.then(|| Arc::new(PipewireLatencyProfiler::default()));
     let profile_reporter_running = Arc::new(AtomicBool::new(true));
     let capture_profiler = profiler.clone();
@@ -411,7 +425,7 @@ pub fn run_pipewire_loop_with_config(
     // 1. Create Capture Stream (Virtual Sink)
     // ------------------------------------------------------------------
 
-    let props = properties! {
+    let mut props = properties! {
         *pw::keys::MEDIA_CLASS => "Audio/Sink",
         *pw::keys::NODE_NAME => "pw-ac3-live-input",
         *pw::keys::NODE_DESCRIPTION => "AC-3 Encoder Input",
@@ -422,6 +436,17 @@ pub fn run_pipewire_loop_with_config(
         "audio.format" => "F32LE",
         "node.latency" => node_latency,
     };
+    if let Some(frames) = requested_latency_frames {
+        let force_quantum = frames.to_string();
+        props.insert("node.force-quantum", force_quantum.as_str());
+        props.insert("node.lock-quantum", "true");
+        props.insert("node.force-rate", SAMPLE_RATE);
+        props.insert("node.lock-rate", "true");
+        info!(
+            "Capture stream requesting forced quantum/rate: {} frames @ {} Hz",
+            frames, SAMPLE_RATE_HZ
+        );
+    }
 
     let data = Arc::new(Mutex::new(input_producer));
     let capture_layout_logged = Arc::new(AtomicBool::new(false));
@@ -649,6 +674,7 @@ pub fn run_pipewire_loop_with_config(
                 run_stdout_output_loop(&mut output_consumer, running_clone.as_ref(), &mut stdout)
             {
                 log::error!("Failed to write to stdout: {}", e);
+                std::process::exit(1);
             }
         });
         info!("Outputting to stdout (playback stream disabled).");
@@ -660,8 +686,37 @@ pub fn run_pipewire_loop_with_config(
         // Strategy: Use properties for Audio/Source
         let mut playback_props = build_playback_properties(&playback_target);
         playback_props.insert("node.latency", node_latency);
+        if let Some(frames) = requested_latency_frames {
+            let force_quantum = frames.to_string();
+            playback_props.insert("node.force-quantum", force_quantum.as_str());
+            playback_props.insert("node.lock-quantum", "true");
+            playback_props.insert("node.force-rate", SAMPLE_RATE);
+            playback_props.insert("node.lock-rate", "true");
+            info!(
+                "Playback stream requesting forced quantum/rate: {} frames @ {} Hz",
+                frames, SAMPLE_RATE_HZ
+            );
+        }
+
+        let output_ring_capacity_bytes = output_consumer.buffer().capacity();
+        let playback_target_quantum_bytes = requested_latency_frames
+            .map(|frames| frames.saturating_mul(OUTPUT_FRAME_BYTES))
+            .filter(|bytes| *bytes > 0)
+            .unwrap_or(0);
+
+        if playback_target_quantum_bytes > 0 {
+            info!(
+                "Playback target quantum: {} frames / {} bytes (ring capacity: {} bytes)",
+                requested_latency_frames.unwrap_or(0),
+                playback_target_quantum_bytes,
+                output_ring_capacity_bytes
+            );
+        }
 
         let output_data = Arc::new(Mutex::new(output_consumer));
+        let playback_primed = Arc::new(AtomicBool::new(false));
+        let playback_prefill_logged = Arc::new(AtomicBool::new(false));
+        let playback_callback_quantum_logged = Arc::new(AtomicBool::new(false));
 
         // Create stream
         let playback_stream =
@@ -709,29 +764,79 @@ pub fn run_pipewire_loop_with_config(
                                 return;
                             }
 
-                            let mut bytes_to_copy = 0usize;
+                            let mut target_write = max_writable;
+                            if output_ring_capacity_bytes > 0 {
+                                target_write = target_write.min(output_ring_capacity_bytes);
+                            }
+                            target_write = (target_write / OUTPUT_FRAME_BYTES) * OUTPUT_FRAME_BYTES;
+                            if target_write == 0 {
+                                return;
+                            }
+
+                            if playback_target_quantum_bytes > 0
+                                && target_write > playback_target_quantum_bytes
+                                && !playback_callback_quantum_logged
+                                    .swap(true, Ordering::Relaxed)
+                            {
+                                info!(
+                                    "Playback callback writable quantum {} bytes exceeds requested latency quantum {} bytes; draining callback-sized chunks for stability.",
+                                    target_write,
+                                    playback_target_quantum_bytes
+                                );
+                            }
+
+                            // Keep stream timing stable: always output a full target quantum.
+                            raw_data[..target_write].fill(0);
+
+                            let prefill_limit = output_ring_capacity_bytes.max(target_write);
+                            // Prime only one callback quantum. Priming deeper on very large
+                            // loopback quantums (e.g. 64 KiB+) makes the ring sit near-full,
+                            // which amplifies backpressure and capture drops.
+                            let prefill_target = target_write.min(prefill_limit);
                             let underrun = if let Ok(mut consumer) = output_data.try_lock() {
                                 let available = consumer.slots();
                                 playback_queue_delay_ms = (available as f64
                                     / (OUTPUT_FRAME_BYTES as f64 * SAMPLE_RATE_HZ as f64))
                                     * 1000.0;
-                                bytes_to_copy = (available.min(max_writable) / OUTPUT_FRAME_BYTES)
-                                    * OUTPUT_FRAME_BYTES;
-                                // Treat partial fills as underruns too: they also indicate starvation.
-                                let underrun = bytes_to_copy < max_writable && max_writable > 0;
 
-                                if bytes_to_copy > 0 {
-                                    if let Ok(chunk) = consumer.read_chunk(bytes_to_copy) {
-                                        for (i, byte) in chunk.into_iter().enumerate() {
-                                            raw_data[i] = byte;
+                                if !playback_primed.load(Ordering::Relaxed) {
+                                    if available >= prefill_target {
+                                        playback_primed.store(true, Ordering::Relaxed);
+                                        if !playback_prefill_logged.swap(true, Ordering::Relaxed)
+                                        {
+                                            info!(
+                                                "Playback jitter buffer primed: queued={} bytes, target_quantum={} bytes",
+                                                available, target_write
+                                            );
                                         }
                                     }
                                 }
-                                underrun
-                            } else {
-                                true
-                            };
-                            (bytes_to_copy, underrun)
+
+                                if playback_primed.load(Ordering::Relaxed) {
+                                    let readable = available
+                                        .min(target_write)
+                                        .saturating_sub(available.min(target_write) % OUTPUT_FRAME_BYTES);
+
+                                    if readable == 0 {
+                                        // Lost headroom; fall back to silence and re-prime.
+                                        playback_primed.store(false, Ordering::Relaxed);
+                                        true
+                                    } else if let Ok(chunk) = consumer.read_chunk(readable) {
+                                        for (i, byte) in chunk.into_iter().enumerate() {
+                                            raw_data[i] = byte;
+                                        }
+                                        readable < target_write
+                                    } else {
+                                        true
+                                    }
+                                } else {
+                                // Startup prefill phase: output silence without counting underruns.
+                                false
+                            }
+                        } else {
+                            true
+                        };
+                            (target_write, underrun)
                         };
 
                         let chunk = datas[0].chunk_mut();

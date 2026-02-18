@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 const INPUT_CHANNELS: usize = 6;
 const SAMPLE_RATE_HZ: f64 = 48_000.0;
 const OUTPUT_FRAME_BYTES: f64 = 4.0;
+const OUTPUT_FRAME_BYTES_U8: usize = 4;
+const MAX_STDOUT_READ_BUFFER_SIZE: usize = 1024;
+const MIN_STDOUT_READ_BUFFER_SIZE: usize = 512;
 const PROFILE_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
@@ -232,6 +235,17 @@ pub fn run_encoder_loop_with_config(
     let profiler_feeder = profiler.clone();
     let profiler_reader = profiler.clone();
     let output_capacity = output.slots();
+    // Keep read chunks small enough to avoid bursty output->playback pressure.
+    let mut stdout_read_buffer_size = (output_capacity / 8)
+        .clamp(MIN_STDOUT_READ_BUFFER_SIZE, MAX_STDOUT_READ_BUFFER_SIZE);
+    stdout_read_buffer_size -= stdout_read_buffer_size % OUTPUT_FRAME_BYTES_U8;
+    if stdout_read_buffer_size == 0 {
+        stdout_read_buffer_size = OUTPUT_FRAME_BYTES_U8;
+    }
+    info!(
+        "FFmpeg stdout read chunk size: {} bytes (output ring capacity: {} bytes)",
+        stdout_read_buffer_size, output_capacity
+    );
 
     let profile_reporter_handle = profiler.as_ref().map(|profiler| {
         let reporter_running = profile_reporter_running.clone();
@@ -291,10 +305,10 @@ pub fn run_encoder_loop_with_config(
                         );
                     }
                 } else {
-                    thread::sleep(Duration::from_millis(1));
+                    thread::sleep(Duration::from_micros(250));
                 }
             } else {
-                thread::sleep(Duration::from_millis(1));
+                thread::sleep(Duration::from_micros(250));
             }
         }
 
@@ -302,7 +316,7 @@ pub fn run_encoder_loop_with_config(
     });
 
     // Run Reader Loop (Stdout -> RingBuffer) in this thread
-    let mut read_buffer = [0u8; 4096];
+    let mut read_buffer = vec![0u8; stdout_read_buffer_size];
     let mut reader_error: Option<anyhow::Error> = None;
 
     loop {
@@ -353,8 +367,8 @@ pub fn run_encoder_loop_with_config(
                             abort_due_to_shutdown_backpressure = true;
                             break;
                         }
-                        thread::sleep(Duration::from_millis(1));
-                        backpressure_delay_ms += 1.0;
+                        thread::sleep(Duration::from_micros(250));
+                        backpressure_delay_ms += 0.25;
                     }
                 }
 

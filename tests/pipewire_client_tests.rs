@@ -131,6 +131,7 @@ mod pipewire_client_impl {
 
             let props = build_playback_properties(&target);
             assert_eq!(props.get("target.object"), Some("42"));
+            assert_eq!(props.get("node.autoconnect"), Some("false"));
         }
 
         #[test]
@@ -147,6 +148,7 @@ mod pipewire_client_impl {
                 props.get("target.object"),
                 Some("alsa_output.pci-0000_00_1f.3.hdmi-stereo")
             );
+            assert_eq!(props.get("node.autoconnect"), Some("false"));
         }
 
         #[test]
@@ -157,6 +159,7 @@ mod pipewire_client_impl {
 
             let props = build_playback_properties(&target);
             assert_eq!(props.get("target.object"), None);
+            assert_eq!(props.get("node.autoconnect"), Some("true"));
         }
 
         #[test]
