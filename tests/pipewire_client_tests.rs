@@ -186,5 +186,160 @@ mod pipewire_client_impl {
             let written = handle.join().expect("stdout loop thread should not panic");
             assert_eq!(written, expected);
         }
+
+        // ── parse_interleaved_from_stride edge cases ──────────────────
+
+        #[test]
+        fn stride_6ch_f32_no_padding() {
+            // 6-channel f32: stride = 6 * 4 = 24 bytes per frame.
+            // Two frames of ascending values.
+            let mut bytes = Vec::new();
+            for frame in 0..2u32 {
+                for ch in 0..6u32 {
+                    let val = (frame * 6 + ch) as f32;
+                    bytes.extend_from_slice(&val.to_le_bytes());
+                }
+            }
+            let parsed = parse_interleaved_from_stride(&bytes, 0, bytes.len(), 24)
+                .expect("6ch f32 should parse");
+            // 2 frames × 6 channels = 12 samples, no zero-padding needed.
+            assert_eq!(parsed.len(), 12);
+            assert_eq!(parsed[0], 0.0); // frame0 ch0
+            assert_eq!(parsed[5], 5.0); // frame0 ch5
+            assert_eq!(parsed[6], 6.0); // frame1 ch0
+            assert_eq!(parsed[11], 11.0); // frame1 ch5
+        }
+
+        #[test]
+        fn stride_mono_f32_pads_to_6ch() {
+            // Mono f32: stride = 4 bytes. Two frames.
+            let mut bytes = Vec::new();
+            for val in [0.5f32, -0.5f32] {
+                bytes.extend_from_slice(&val.to_le_bytes());
+            }
+            let parsed = parse_interleaved_from_stride(&bytes, 0, bytes.len(), 4)
+                .expect("mono f32 should parse");
+            // 2 frames × 6 channels = 12 samples
+            assert_eq!(parsed.len(), 12);
+            assert_eq!(parsed[0], 0.5); // frame0 ch0
+            assert_eq!(parsed[1], 0.0); // frame0 ch1 (padded)
+            assert_eq!(parsed[5], 0.0); // frame0 ch5 (padded)
+            assert_eq!(parsed[6], -0.5); // frame1 ch0
+            assert_eq!(parsed[7], 0.0); // frame1 ch1 (padded)
+        }
+
+        #[test]
+        fn stride_6ch_s16() {
+            // 6-channel s16: stride = 6 * 2 = 12 bytes per frame.
+            let mut bytes = Vec::new();
+            for val in [i16::MAX, 0i16, i16::MIN, 1000i16, -1000i16, 500i16] {
+                bytes.extend_from_slice(&val.to_le_bytes());
+            }
+            let parsed = parse_interleaved_from_stride(&bytes, 0, bytes.len(), 12)
+                .expect("6ch s16 should parse");
+            assert_eq!(parsed.len(), 6);
+            // All values should be finite floats in [-1.0, 1.0)
+            for sample in &parsed {
+                assert!(sample.is_finite());
+                assert!(*sample >= -1.0 && *sample <= 1.0);
+            }
+        }
+
+        #[test]
+        fn stride_mono_s16_pads_to_6ch() {
+            // Mono s16: stride = 2 bytes. Two frames.
+            let mut bytes = Vec::new();
+            for val in [16000i16, -16000i16] {
+                bytes.extend_from_slice(&val.to_le_bytes());
+            }
+            let parsed = parse_interleaved_from_stride(&bytes, 0, bytes.len(), 2)
+                .expect("mono s16 should parse");
+            assert_eq!(parsed.len(), 12);
+            assert!(parsed[0].is_finite() && parsed[0] > 0.0);
+            assert_eq!(parsed[1], 0.0); // padded
+            assert_eq!(parsed[5], 0.0); // padded
+            assert!(parsed[6].is_finite() && parsed[6] < 0.0);
+            assert_eq!(parsed[7], 0.0); // padded
+        }
+
+        #[test]
+        fn stride_invalid_size_returns_none() {
+            // Stride of 3 is not a multiple of sizeof(f32) or sizeof(i16).
+            let bytes = vec![0u8; 12];
+            assert!(parse_interleaved_from_stride(&bytes, 0, bytes.len(), 3).is_none());
+        }
+
+        #[test]
+        fn stride_zero_returns_none() {
+            let bytes = vec![0u8; 8];
+            assert!(parse_interleaved_from_stride(&bytes, 0, bytes.len(), 0).is_none());
+        }
+
+        #[test]
+        fn stride_too_few_bytes_returns_none() {
+            // Data shorter than one stride.
+            let bytes = vec![0u8; 3];
+            assert!(parse_interleaved_from_stride(&bytes, 0, bytes.len(), 8).is_none());
+        }
+
+        #[test]
+        fn stride_7ch_f32_exceeds_max_returns_none() {
+            // 7-channel f32: stride = 28 bytes. Exceeds INPUT_CHANNELS (6).
+            let bytes = vec![0u8; 56]; // 2 frames
+            assert!(parse_interleaved_from_stride(&bytes, 0, bytes.len(), 28).is_none());
+        }
+
+        // ── resolve_playback_target ───────────────────────────────────
+
+        #[test]
+        fn playback_target_none_enables_autoconnect() {
+            let target = resolve_playback_target(None);
+            assert_eq!(target.connect_target_id, None);
+            assert_eq!(target.target_object, None);
+
+            let props = build_playback_properties(&target);
+            assert_eq!(props.get("target.object"), None);
+            assert_eq!(props.get("node.autoconnect"), Some("true"));
+        }
+
+        // ── run_stdout_output_loop edge cases ─────────────────────────
+
+        #[test]
+        fn stdout_output_loop_empty_buffer_exits_cleanly() {
+            let (_producer, mut consumer) = RingBuffer::<u8>::new(32);
+            let running = AtomicBool::new(false); // already stopped
+            let mut written = Vec::<u8>::new();
+            run_stdout_output_loop(&mut consumer, &running, &mut written)
+                .expect("should exit cleanly");
+            assert!(written.is_empty());
+        }
+
+        #[test]
+        fn stdout_output_loop_propagates_write_error() {
+            use std::io;
+
+            struct FailWriter;
+            impl Write for FailWriter {
+                fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "mock error"))
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            let (mut producer, mut consumer) = RingBuffer::<u8>::new(32);
+            {
+                let chunk = producer
+                    .write_chunk_uninit(4)
+                    .expect("should have space");
+                chunk.fill_from_iter([1u8, 2, 3, 4].iter().copied());
+            }
+
+            let running = AtomicBool::new(true);
+            let mut writer = FailWriter;
+            let result = run_stdout_output_loop(&mut consumer, &running, &mut writer);
+            assert!(result.is_err());
+        }
     }
 }

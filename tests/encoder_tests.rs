@@ -137,10 +137,10 @@ fn test_encoder_multichannel_structure() {
         encoder::run_encoder_loop(input_consumer, output_producer, encoder_running)
     });
 
-    // Generate 0.5 seconds of "multichannel" data
+    // Generate 1 seconds of "multichannel" data
     // Channel i gets value i/10.0
     // L=0.0, R=0.1, C=0.2, LFE=0.3, LS=0.4, RS=0.5
-    let frames = 48000 / 2;
+    let frames = 48000;
     let mut data = Vec::with_capacity(frames * 6);
     for _ in 0..frames {
         for ch in 0..6 {
@@ -327,3 +327,314 @@ fn test_encoder_shutdown_under_output_backpressure() {
         "encoder loop returned error: {loop_result:?}"
     );
 }
+
+#[test]
+fn test_encoder_custom_config() {
+    // Use minimal config values to exercise .max(1) clamping paths.
+    let buffer_size = 48000 * 6;
+    let (mut input_producer, input_consumer) = RingBuffer::<f32>::new(buffer_size);
+    let (output_producer, output_consumer) = RingBuffer::<u8>::new(buffer_size * 4);
+
+    let running = Arc::new(AtomicBool::new(true));
+    let encoder_running = running.clone();
+
+    let config = encoder::EncoderConfig {
+        ffmpeg_thread_queue_size: 1,
+        feeder_chunk_frames: 1,
+    };
+
+    let encoder_handle = thread::spawn(move || {
+        encoder::run_encoder_loop_with_config(input_consumer, output_producer, encoder_running, config)
+    });
+
+    // Feed 0.5s of silence
+    let samples = 48000 / 2 * 6;
+    let silence = vec![0.0f32; samples];
+    let mut written = 0;
+    while written < samples {
+        let request = (samples - written).min(256);
+        if let Ok(chunk) = input_producer.write_chunk_uninit(request) {
+            let n = chunk.len();
+            chunk.fill_from_iter(silence[written..written + n].iter().copied());
+            written += n;
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    thread::sleep(Duration::from_millis(500));
+    running.store(false, Ordering::SeqCst);
+    let result = encoder_handle.join();
+    assert!(result.is_ok(), "encoder thread panicked with custom config");
+
+    assert!(
+        output_consumer.slots() > 0,
+        "Encoder with custom config should produce output"
+    );
+}
+
+#[test]
+fn test_encoder_zero_config_values() {
+    // Zero values should be clamped to 1 by .max(1), not panic.
+    let buffer_size = 48000 * 6;
+    let (mut input_producer, input_consumer) = RingBuffer::<f32>::new(buffer_size);
+    let (output_producer, output_consumer) = RingBuffer::<u8>::new(buffer_size * 4);
+
+    let running = Arc::new(AtomicBool::new(true));
+    let encoder_running = running.clone();
+
+    let config = encoder::EncoderConfig {
+        ffmpeg_thread_queue_size: 0,
+        feeder_chunk_frames: 0,
+    };
+
+    let encoder_handle = thread::spawn(move || {
+        encoder::run_encoder_loop_with_config(input_consumer, output_producer, encoder_running, config)
+    });
+
+    let silence = vec![0.0f32; 48000];
+    if let Ok(chunk) = input_producer.write_chunk_uninit(silence.len()) {
+        chunk.fill_from_iter(silence.into_iter());
+    }
+
+    let start = Instant::now();
+    while output_consumer.slots() == 0 {
+        if start.elapsed() > Duration::from_secs(2) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    running.store(false, Ordering::SeqCst);
+    let result = encoder_handle.join();
+    assert!(result.is_ok(), "encoder thread panicked with zero config");
+    assert!(
+        output_consumer.slots() > 0,
+        "Encoder with zero (clamped) config should produce output"
+    );
+}
+
+#[test]
+fn test_encoder_tiny_output_buffer() {
+    // Very small output ring to exercise stdout_read_buffer_size clamping.
+    let (mut input_producer, input_consumer) = RingBuffer::<f32>::new(48000 * 6);
+    let (output_producer, mut output_consumer) = RingBuffer::<u8>::new(64);
+
+    let running = Arc::new(AtomicBool::new(true));
+    let encoder_running = running.clone();
+
+    let encoder_handle = thread::spawn(move || {
+        encoder::run_encoder_loop(input_consumer, output_producer, encoder_running)
+    });
+
+    // Feed data and continuously drain the tiny output buffer.
+    let silence = vec![0.0f32; 48000 * 6];
+    let mut written = 0;
+    while written < silence.len() {
+        let request = (silence.len() - written).min(1024);
+        if let Ok(chunk) = input_producer.write_chunk_uninit(request) {
+            let n = chunk.len();
+            chunk.fill_from_iter(silence[written..written + n].iter().copied());
+            written += n;
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    // Drain output for a bit so the encoder doesn't stall on backpressure.
+    let mut total_drained = 0usize;
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < drain_deadline {
+        let available = output_consumer.slots();
+        if available > 0 {
+            if let Ok(chunk) = output_consumer.read_chunk(available) {
+                total_drained += chunk.len();
+                chunk.commit_all();
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    running.store(false, Ordering::SeqCst);
+    let result = encoder_handle.join();
+    assert!(result.is_ok(), "encoder panicked with tiny output buffer");
+    assert!(
+        total_drained > 0,
+        "Should have drained some data from tiny output buffer"
+    );
+}
+
+#[test]
+fn test_encoder_output_frame_aligned() {
+    // Verify output byte count is a multiple of OUTPUT_FRAME_BYTES_U8 (4).
+    let buffer_size = 48000 * 6;
+    let (mut input_producer, input_consumer) = RingBuffer::<f32>::new(buffer_size);
+    let (output_producer, output_consumer) = RingBuffer::<u8>::new(buffer_size * 4);
+
+    let running = Arc::new(AtomicBool::new(true));
+    let encoder_running = running.clone();
+
+    let encoder_handle = thread::spawn(move || {
+        encoder::run_encoder_loop(input_consumer, output_producer, encoder_running)
+    });
+
+    let samples = 48000 * 6;
+    let silence = vec![0.0f32; samples];
+    let mut written = 0;
+    while written < samples {
+        let request = (samples - written).min(1024);
+        if let Ok(chunk) = input_producer.write_chunk_uninit(request) {
+            let n = chunk.len();
+            chunk.fill_from_iter(silence[written..written + n].iter().copied());
+            written += n;
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    thread::sleep(Duration::from_millis(500));
+    running.store(false, Ordering::SeqCst);
+    let _ = encoder_handle.join().unwrap();
+
+    let available = output_consumer.slots();
+    assert!(available > 0, "Should have output data");
+    // IEC 61937 output should be frame-aligned to 4 bytes (2ch × S16LE).
+    assert_eq!(
+        available % 4,
+        0,
+        "Output byte count {} is not frame-aligned to 4 bytes",
+        available
+    );
+}
+
+#[test]
+fn test_encoder_multiple_iec61937_frames() {
+    // Feed 2 seconds of audio and count IEC 61937 preambles.
+    // AC-3 at 48kHz produces ~31.25 frames/sec → expect ≥10 in 2s.
+    let buffer_size = 48000 * 6 * 3; // big enough for 2s+
+    let (mut input_producer, input_consumer) = RingBuffer::<f32>::new(buffer_size);
+    let (output_producer, mut output_consumer) = RingBuffer::<u8>::new(buffer_size * 4);
+
+    let running = Arc::new(AtomicBool::new(true));
+    let encoder_running = running.clone();
+
+    let encoder_handle = thread::spawn(move || {
+        encoder::run_encoder_loop(input_consumer, output_producer, encoder_running)
+    });
+
+    // Feed 2 seconds of silence
+    let total_samples = 48000 * 2 * 6;
+    let silence = vec![0.0f32; total_samples];
+    let mut written = 0;
+    while written < total_samples {
+        let request = (total_samples - written).min(1024);
+        if let Ok(chunk) = input_producer.write_chunk_uninit(request) {
+            let n = chunk.len();
+            chunk.fill_from_iter(silence[written..written + n].iter().copied());
+            written += n;
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    thread::sleep(Duration::from_millis(1500));
+    running.store(false, Ordering::SeqCst);
+    let _ = encoder_handle.join().unwrap();
+
+    // Drain all output
+    let available = output_consumer.slots();
+    let mut data = vec![0u8; available];
+    if let Ok(chunk) = output_consumer.read_chunk(available) {
+        for (i, byte) in chunk.into_iter().enumerate() {
+            data[i] = byte;
+        }
+    }
+
+    // Count IEC 61937 preambles: [0x72, 0xF8, 0x1F, 0x4E]
+    let preamble = [0x72u8, 0xF8, 0x1F, 0x4E];
+    let mut count = 0;
+    if data.len() >= 4 {
+        for i in 0..data.len() - 3 {
+            if &data[i..i + 4] == &preamble {
+                count += 1;
+            }
+        }
+    }
+
+    println!("Found {} IEC 61937 preambles in {} bytes", count, data.len());
+    assert!(
+        count >= 10,
+        "Expected ≥10 IEC 61937 frames for 2s of audio, found {}",
+        count
+    );
+}
+
+#[test]
+fn test_encoder_iec61937_frame_spacing() {
+    // Verify IEC 61937 frames are at 6144-byte intervals (AC-3 standard).
+    let buffer_size = 48000 * 6 * 3;
+    let (mut input_producer, input_consumer) = RingBuffer::<f32>::new(buffer_size);
+    let (output_producer, mut output_consumer) = RingBuffer::<u8>::new(buffer_size * 4);
+
+    let running = Arc::new(AtomicBool::new(true));
+    let encoder_running = running.clone();
+
+    let encoder_handle = thread::spawn(move || {
+        encoder::run_encoder_loop(input_consumer, output_producer, encoder_running)
+    });
+
+    let total_samples = 48000 * 2 * 6;
+    let silence = vec![0.0f32; total_samples];
+    let mut written = 0;
+    while written < total_samples {
+        let request = (total_samples - written).min(1024);
+        if let Ok(chunk) = input_producer.write_chunk_uninit(request) {
+            let n = chunk.len();
+            chunk.fill_from_iter(silence[written..written + n].iter().copied());
+            written += n;
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    thread::sleep(Duration::from_millis(1500));
+    running.store(false, Ordering::SeqCst);
+    let _ = encoder_handle.join().unwrap();
+
+    let available = output_consumer.slots();
+    let mut data = vec![0u8; available];
+    if let Ok(chunk) = output_consumer.read_chunk(available) {
+        for (i, byte) in chunk.into_iter().enumerate() {
+            data[i] = byte;
+        }
+    }
+
+    // Find all preamble positions
+    let preamble = [0x72u8, 0xF8, 0x1F, 0x4E];
+    let mut positions = Vec::new();
+    if data.len() >= 4 {
+        for i in 0..data.len() - 3 {
+            if &data[i..i + 4] == &preamble {
+                positions.push(i);
+            }
+        }
+    }
+
+    assert!(
+        positions.len() >= 3,
+        "Need at least 3 preambles to check spacing, found {}",
+        positions.len()
+    );
+
+    // Check spacing between consecutive preambles.
+    // AC-3 IEC 61937: each burst = 6144 bytes (1536 frames × 2 channels × 2 bytes/sample).
+    for window in positions.windows(2) {
+        let spacing = window[1] - window[0];
+        assert_eq!(
+            spacing, 6144,
+            "IEC 61937 frame spacing should be 6144 bytes, got {} (at positions {} and {})",
+            spacing, window[0], window[1]
+        );
+    }
+}
+
