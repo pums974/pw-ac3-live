@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn test_encoder_throughput() {
@@ -103,7 +103,13 @@ fn test_encoder_stress() {
                 chunk.fill_from_iter(silence.into_iter());
             }
 
-            thread::sleep(Duration::from_millis(100));
+            let start = Instant::now();
+            while output_consumer.slots() == 0 {
+                if start.elapsed() > Duration::from_secs(2) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
 
             running.store(false, Ordering::SeqCst);
             let _ = t.join().unwrap();
@@ -257,7 +263,13 @@ fn test_encoder_restart() {
             chunk.fill_from_iter(silence.into_iter());
         }
 
-        thread::sleep(Duration::from_millis(200));
+        let start = Instant::now();
+        while output_consumer.slots() == 0 {
+            if start.elapsed() > Duration::from_secs(2) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         running.store(false, Ordering::SeqCst);
         let result = encoder_handle.join();
         assert!(result.is_ok(), "Encoder failed to join on iteration {}", i);
