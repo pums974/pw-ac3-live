@@ -35,4 +35,3 @@ UV_CACHE_DIR=/tmp/uv-cache uvx pre-commit run <hook-id> -a
 ```bash
 git add --chmod=+x <script>
 ```
-
