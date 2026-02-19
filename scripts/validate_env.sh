@@ -38,11 +38,67 @@ check() {
     echo ""
 }
 
+# Keep fixed-width tables readable when names are very long.
+shorten() {
+    local text="$1" max_len="$2"
+    if [ "${#text}" -le "$max_len" ]; then
+        printf "%s" "$text"
+    else
+        printf "%s..." "${text:0:$((max_len - 3))}"
+    fi
+}
+
+get_card_active_profile() {
+    local card_name="$1"
+    echo "$PACTL_CARDS" | awk -v c="$card_name" '
+        $1=="Name:" && $2==c { found=1; next }
+        found && $1=="Active" && $2=="Profile:" {
+            $1=""
+            $2=""
+            sub(/^[[:space:]]+/, "", $0)
+            print $0
+            exit
+        }
+        found && $1=="Name:" && $2!=c { exit }
+    '
+}
+
+get_sink_card_and_profile() {
+    local sink_name="$1"
+    echo "$PACTL_SINKS" | awk -v s="$sink_name" '
+        /^Sink #[0-9]+/ {
+            if (in_sink) exit
+            in_sink=0
+        }
+        /^[[:space:]]+Name:/ {
+            if ($2 == s) {
+                in_sink=1
+            } else if (in_sink) {
+                exit
+            }
+            next
+        }
+        in_sink && /alsa.card_name =/ && card=="" {
+            if (match($0, /"[^"]+"/)) card=substr($0, RSTART+1, RLENGTH-2)
+        }
+        in_sink && /device.profile.name =/ && profile=="" {
+            if (match($0, /"[^"]+"/)) profile=substr($0, RSTART+1, RLENGTH-2)
+        }
+        END {
+            if (card=="") card="?"
+            if (profile=="") profile="?"
+            print card "\t" profile
+        }
+    '
+}
+
 # Cache pactl output once
 PACTL_CARDS=""
+PACTL_SINKS=""
 has_pactl() { command -v pactl >/dev/null 2>&1; }
 if has_pactl; then
     PACTL_CARDS=$(pactl list cards 2>/dev/null || true)
+    PACTL_SINKS=$(pactl list sinks 2>/dev/null || true)
 fi
 
 # ══════════════════════════════════════════════════════════════════════
@@ -87,59 +143,123 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-# ── 3. HDMI Cards & Profiles ─────────────────────────────────────────
-header "HDMI Cards & Profiles"
+# ── 3. PipeWire Cards & Profiles ─────────────────────────────────────
+header "PipeWire Cards & Profiles"
 
 if has_pactl; then
     CARDS_SHORT=$(pactl list cards short 2>/dev/null || true)
-    if [ -n "$CARDS_SHORT" ]; then
+    if [ -z "$CARDS_SHORT" ]; then
+        check "PipeWire cards" "$WARN" "none found via pactl"
+        WARNINGS=$((WARNINGS + 1))
+    else
+        detail "* marks the active profile"
         while IFS=$'\t' read -r card_idx card_name _rest; do
             [ -z "$card_name" ] && continue
-            ACTIVE_PROFILE=$(echo "$PACTL_CARDS" | awk -v c="$card_name" '
-                $1=="Name:" && $2==c { found=1; next }
-                found && $1=="Active" && $2=="Profile:" { print $3; exit }
-                found && $1=="Name:" && $2!=c { exit }
-            ')
+            ACTIVE_PROFILE=$(get_card_active_profile "$card_name")
 
-            HAS_HDMI=$(echo "$PACTL_CARDS" | awk -v c="$card_name" '
-                $1=="Name:" && $2==c { found=1; next }
-                found && /output:hdmi/ { print "yes"; exit }
-                found && $1=="Name:" && $2!=c { exit }
-            ')
+            check "Card #${card_idx}: ${card_name}" "$INFO" "active profile: ${ACTIVE_PROFILE:-?}"
 
-            if [ "$HAS_HDMI" = "yes" ]; then
-                HDMI_STEREO=$(echo "$PACTL_CARDS" | awk -v c="$card_name" '
-                    $1=="Name:" && $2==c { found=1; next }
-                    found && /output:hdmi-stereo/ && !/surround/ && /available: yes/ { gsub(/:$/,"",$1); print $1; }
-                    found && $1=="Name:" && $2!=c { exit }
-                ')
-                if [ -n "$HDMI_STEREO" ]; then
-                    check "Card: $card_name" "$PASS" "active profile: ${ACTIVE_PROFILE:-?}"
-                else
-                    check "Card: $card_name" "$INFO" "active profile: ${ACTIVE_PROFILE:-?}  (no usable hdmi-stereo)"
-                fi
+            PROFILE_LINES=$(echo "$PACTL_CARDS" | awk -v c="$card_name" -v active="$ACTIVE_PROFILE" '
+                BEGIN { in_card=0; in_profiles=0; found=0; active_marked=0 }
+                $1=="Name:" { in_card=($2==c); in_profiles=0; next }
+                in_card && $1=="Profiles:" { in_profiles=1; next }
+                in_card && $1=="Active" && $2=="Profile:" { exit }
+                in_card && in_profiles {
+                    if ($0 !~ /^[[:space:]]+/) next
+                    line=$0
+                    gsub(/^[[:space:]]+/, "", line)
 
-                echo "$PACTL_CARDS" | awk -v c="$card_name" '
-                    $1=="Name:" && $2==c { found=1; next }
-                    found && /^[[:space:]]+output:hdmi/ && !/Part of/ {
-                        line=$0; gsub(/^[[:space:]]+/,"",line)
-                        if (match(line, /: [A-Z]/)) {
-                            pname = substr(line, 1, RSTART-1)
-                        } else {
-                            pname = $1; gsub(/:$/,"",pname)
-                        }
-                        avail=""
-                        if (match($0, /available: (yes|no)/, m)) avail=m[1]
-                        printf "    %-55s %s\n", pname, avail
+                    sep=index(line, ": ")
+                    if (sep > 0) {
+                        pname=substr(line, 1, sep-1)
+                        details=substr(line, sep+2)
+                    } else {
+                        pname=line
+                        details=""
                     }
-                    found && $1=="Name:" && $2!=c { exit }
-                '
-            fi
+                    if (pname=="") next
+
+                    avail="unknown"
+                    if (match(line, /available: (yes|no|unknown)/, m)) avail=m[1]
+                    status=(avail=="yes" ? "ready" : (avail=="no" ? "not-ready" : "unknown"))
+
+                    # Render availability as a readable status; keep the rest as context.
+                    sub(/[[:space:]]*,?[[:space:]]*available: (yes|no|unknown)/, "", details)
+                    gsub(/[[:space:]]+$/, "", details)
+
+                    seen[pname]++
+                    display_name=pname
+                    if (seen[pname] > 1) {
+                        display_name=pname " #" seen[pname]
+                    }
+
+                    if (pname==active && active_marked==0) {
+                        marker="*"
+                        active_marked=1
+                    } else {
+                        marker=" "
+                    }
+                    printf "    %s %-40s %-10s %s\n", marker, display_name, status, details
+                    found=1
+                }
+                END {
+                    if (!found) print "    (no profiles reported)"
+                }
+            ')
+            echo "$PROFILE_LINES"
         done <<< "$CARDS_SHORT"
     fi
+else
+    check "pactl cards listing" "$SKIP" "pactl not available"
 fi
 
-# ── 4. ALSA Hardware ─────────────────────────────────────────────────
+# ── 4. PipeWire Objects Tables ───────────────────────────────────────
+header "PipeWire Objects Tables"
+
+if has_pactl; then
+    CARDS_SHORT=$(pactl list cards short 2>/dev/null || true)
+    SINKS_SHORT=$(pactl list sinks short 2>/dev/null || true)
+
+    detail "Card objects (from \`pactl list cards short\`)"
+    printf "    %-5s %-50s %-18s %-28s\n" "idx" "card.object" "driver" "active-profile"
+    printf "    %-5s %-50s %-18s %-28s\n" "---" "-----------" "------" "--------------"
+    if [ -n "$CARDS_SHORT" ]; then
+        while IFS=$'\t' read -r card_idx card_name card_driver _rest; do
+            [ -z "$card_name" ] && continue
+            active_profile=$(get_card_active_profile "$card_name")
+            card_name_show=$(shorten "$card_name" 50)
+            card_driver_show=$(shorten "${card_driver:-?}" 18)
+            active_profile_show=$(shorten "${active_profile:-?}" 28)
+            printf "    %-5s %-50s %-18s %-28s\n" "$card_idx" "$card_name_show" "$card_driver_show" "$active_profile_show"
+        done <<< "$CARDS_SHORT"
+    else
+        echo "    (no cards found)"
+    fi
+
+    detail "Sink node names (from \`pactl list sinks short\`)"
+    printf "    %-5s %-50s %-10s %-7s %-24s %-22s\n" "idx" "sink.node.name" "state" "ch" "alsa.card_name" "profile"
+    printf "    %-5s %-50s %-10s %-7s %-24s %-22s\n" "---" "--------------" "-----" "--" "--------------" "-------"
+    if [ -n "$SINKS_SHORT" ]; then
+        while IFS=$'\t' read -r sink_idx sink_name sink_driver sink_spec sink_state _rest; do
+            [ -z "$sink_name" ] && continue
+            channel_count=$(echo "$sink_spec" | grep -oE '[0-9]+ch' | head -1 || true)
+            [ -z "$channel_count" ] && channel_count="?"
+            IFS=$'\t' read -r sink_card_name sink_profile_name <<< "$(get_sink_card_and_profile "$sink_name")"
+            sink_name_show=$(shorten "$sink_name" 50)
+            sink_state_show=$(shorten "${sink_state:-?}" 10)
+            sink_card_show=$(shorten "${sink_card_name:-?}" 24)
+            sink_profile_show=$(shorten "${sink_profile_name:-?}" 22)
+            printf "    %-5s %-50s %-10s %-7s %-24s %-22s\n" \
+                "$sink_idx" "$sink_name_show" "$sink_state_show" "$channel_count" "$sink_card_show" "$sink_profile_show"
+        done <<< "$SINKS_SHORT"
+    else
+        echo "    (no sinks found)"
+    fi
+else
+    check "PipeWire objects table" "$SKIP" "pactl not available"
+fi
+
+# ── 5. ALSA Hardware ─────────────────────────────────────────────────
 header "ALSA Hardware"
 
 if [ -d "/proc/asound" ]; then
@@ -152,16 +272,55 @@ if [ -d "/proc/asound" ]; then
             [ -f "$pcm_file" ] || continue
             pcm_name=$(echo "$pcm_file" | grep -oP 'pcm\d+')
             dev_num=$(echo "$pcm_name" | grep -oP '\d+')
-            state=$(head -1 "$pcm_file" 2>/dev/null | awk '{print $2}')
+            status_line=$(head -1 "$pcm_file" 2>/dev/null || true)
+            state=$(echo "$status_line" | awk '{print $2}')
+            [ -z "$state" ] && state=$(echo "$status_line" | awk '{print toupper($1)}')
+            [ -z "$state" ] && state="CLOSED"
 
-            if [ "$dev_num" -ge 3 ] 2>/dev/null || [ "$state" = "RUNNING" ]; then
+            info_file="${card_dir}${pcm_name}p/info"
+            pcm_id=$(awk -F ': ' '/^id:/ { print $2; exit }' "$info_file" 2>/dev/null || true)
+            [ -z "$pcm_id" ] && pcm_id="$pcm_name"
+
+            if echo "$pcm_id" | grep -qi 'HDMI'; then
+                endpoint_kind="HDMI"
+            else
+                endpoint_kind="non-HDMI"
+            fi
+
+            case "$state" in
+                RUNNING)
+                    check_state="$PASS"
+                    state_label="in use (streaming)"
+                    ;;
+                PREPARED)
+                    check_state="$INFO"
+                    state_label="opened (ready)"
+                    ;;
+                XRUN)
+                    check_state="$WARN"
+                    state_label="xrun (underrun/overrun)"
+                    WARNINGS=$((WARNINGS + 1))
+                    ;;
+                DRAINING)
+                    check_state="$INFO"
+                    state_label="draining"
+                    ;;
+                SUSPENDED)
+                    check_state="$INFO"
+                    state_label="suspended"
+                    ;;
+                *)
+                    check_state="$INFO"
+                    state_label="idle (free)"
+                    ;;
+            esac
+
+            if [ "$dev_num" -ge 3 ] 2>/dev/null || [ "$state" = "RUNNING" ] || [ "$state" = "PREPARED" ]; then
                 if [ "$state" = "RUNNING" ]; then
-                    hw_info=$(cat "$pcm_file" 2>/dev/null | head -5 | grep -E "rate|format" | tr '\n' ', ' | sed 's/,$//')
-                    check "hw:${card_num},${dev_num} (${card_id})" "$PASS" "RUNNING ${hw_info:+[$hw_info]}"
-                elif [ "$state" = "PREPARED" ]; then
-                    check "hw:${card_num},${dev_num} (${card_id})" "$INFO" "PREPARED"
+                    hw_info=$(head -5 "$pcm_file" 2>/dev/null | grep -E "rate|format" | tr '\n' ', ' | sed 's/,$//')
+                    check "hw:${card_num},${dev_num} (${card_id}/${pcm_id})" "$check_state" "${endpoint_kind}, ${state_label}${hw_info:+ [$hw_info]}"
                 else
-                    check "hw:${card_num},${dev_num} (${card_id})" "$INFO" "${state:-closed}"
+                    check "hw:${card_num},${dev_num} (${card_id}/${pcm_id})" "$check_state" "${endpoint_kind}, ${state_label}"
                 fi
             fi
         done
@@ -170,7 +329,7 @@ else
     check "ALSA /proc/asound" "$SKIP" "not available"
 fi
 
-# ── 5. ELD (EDID-Like Data) ──────────────────────────────────────────
+# ── 6. ELD (EDID-Like Data) ──────────────────────────────────────────
 header "ELD — Connected Monitors / Receivers"
 
 HAS_ELD=0
