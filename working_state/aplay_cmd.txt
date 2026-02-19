@@ -1,1 +1,0 @@
-aplay -D hw:0,8 --disable-resample --disable-format --disable-channels --disable-softvol -v -t raw -f S16_LE -r 48000 -c 2 --buffer-time=200000 --period-time=20000

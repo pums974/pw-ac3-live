@@ -64,7 +64,7 @@ Quick start on Deck (desktop mode):
 1) tar -xzf pw-ac3-live-steamdeck-*.tar.gz
 2) cd pw-ac3-live-steamdeck-*
 3) chmod +x run.sh scripts/*.sh
-4) ./scripts/launch_live.sh
+4) ./scripts/launch_live_steamdeck.sh
 EOF
 
 chmod +x "${PKG_DIR}/run.sh" "${PKG_DIR}/bin/${APP_NAME}" "${PKG_DIR}/scripts/"*.sh

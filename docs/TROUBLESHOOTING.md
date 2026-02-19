@@ -4,6 +4,29 @@ This guide covers common issues encountered when using `pw-ac3-live` and the Dir
 
 ---
 
+## 0. Run Built-In Validators First
+Before deep debugging, run these scripts in order to quickly narrow down whether the problem is environment setup, live runtime state, or perceived audio behavior.
+
+### Environment validation (static setup)
+Checks required tools, PipeWire cards/profiles, ALSA endpoints, and HDMI/ELD capabilities.
+```bash
+./scripts/validate_env.sh
+```
+
+### Runtime validation (live pipeline state)
+Checks process status, PipeWire links/nodes, sink routing, active ALSA streams, and IEC958 status while the pipeline is running.
+```bash
+./scripts/validate_runtime.sh
+```
+
+### Interactive audio validation (human hearing checks)
+Plays controlled test signals and asks you to confirm audibility, channel mapping, and rough latency perception.
+```bash
+./scripts/validate_audio.sh
+```
+
+---
+
 ## 1. Loud Noise / Static (The "Zombie State")
 **Symptoms:** You hear loud white noise or static instead of audio.
 **Cause:** The HDMI audio driver is in a "Zombie State" or the sink is configured incorrectly.
@@ -87,7 +110,7 @@ PW_AC3_OUTPUT_BUFFER_SIZE=6144 ./scripts/launch_live_steamdeck.sh
 ### Verification
 Run the channel test script to confirm if the **encoder** is working correctly:
 ```bash
-./tests/scripts/test_surround_sequential.sh
+./scripts/validate_audio.sh
 ```
 - If this test plays correctly on all speakers, the encoder pipeline is **fine**.
 - The issue is likely your source app (e.g., Browser) or Windows game running in Proton not configured for 5.1.
