@@ -9,7 +9,7 @@ I only have a limited knowledge of the tools used in this project (Rust, PipeWir
 ## Purpose
 Some HDMI sinks expose only stereo PCM but still accept AC-3 passthrough. This project creates a virtual 5.1 sink, encodes incoming audio to AC-3 with `ffmpeg`, and outputs an IEC61937 stream for playback.
 
-The encoded stream is delivered through one of two co-equal output paths:
+The encoded stream is delivered through one of two possible output paths:
 - **PipeWire Native** — plays back through a PipeWire output source node within the graph. Used on standard Linux desktops.
 - **Direct ALSA** — pipes the encoded stream to `aplay` for exclusive hardware access, bypassing the PipeWire graph entirely. Used on platforms like the Steam Deck where PipeWire's ALSA sink plugin introduces unacceptable stuttering or scheduling jitter for encoded bitstreams.
 

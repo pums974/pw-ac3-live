@@ -50,7 +50,7 @@ To ensure glitch-free audio, we strictly separate real-time (RT) tasks from comp
 
 ### 4. Playback & Output Architecture
 
-The encoded IEC 61937 stream is delivered to the hardware via one of two co-equal output paths, selected by the platform-specific launcher script.
+The encoded IEC 61937 stream is delivered to the hardware via one of two possible output paths, selected by the platform-specific launcher script.
 
 #### Path A: PipeWire Native
 The standard output path for desktop Linux setups where PipeWire's ALSA plugin performs well.
