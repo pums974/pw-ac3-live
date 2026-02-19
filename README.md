@@ -1,9 +1,19 @@
 # PipeWire AC-3 Live Encoder
 
-`pw-ac3-live` is a real-time 5.1 LPCM to AC-3 (Dolby Digital) encoder for PipeWire.
+`pw-ac3-live` is a real-time 5.1 LPCM to AC-3 (Dolby Digital) encoder for PipeWire/ALSA.
 
 ## Purpose
 Some HDMI sinks expose only stereo PCM but still accept AC-3 passthrough. This project creates a virtual 5.1 sink, encodes incoming audio to AC-3 with `ffmpeg`, and outputs an IEC61937 stream for playback.
+
+The encoded stream is delivered through one of two co-equal output paths:
+- **PipeWire Native** — plays back through a PipeWire output source node within the graph. Used on standard Linux desktops.
+- **Direct ALSA** — pipes the encoded stream to `aplay` for exclusive hardware access, bypassing the PipeWire graph entirely. Used on platforms like the Steam Deck where PipeWire's ALSA sink plugin introduces unacceptable stuttering or scheduling jitter for encoded bitstreams.
+
+This project is only a proof of concept and is not intended for production use.
+
+This project has only been tested on the following path: 
+* Steam Deck → Valve Dock → HDMI → LG C4 TV → Optical (SPDIF) → Sony DAV-DZ340 (5.1) (uses `scripts/launch_live_steamdeck.sh`)
+* Archlinux laptop → HDMI → LG C4 TV → Optical (SPDIF) → Sony DAV-DZ340 (5.1) (uses `scripts/launch_live_laptop.sh`)
 
 ## Requirements
 - Rust toolchain
@@ -60,262 +70,53 @@ Latency-related knobs:
 - `--ffmpeg-chunk-frames`: frame batch size written to FFmpeg (default `128`).
 - `--profile-latency`: emits per-stage latency stats (`avg/p50/p95/max`) every second.
 
-With the launcher script:
-```bash
-PW_AC3_PROFILE_LATENCY=1 ./scripts/launch_live.sh
+With the launcher scripts (choose the one for your platform):
 
+```bash
+# For Steam Deck (hardcoded for Valve Dock + specific HDMI sink)
+./scripts/launch_live_steamdeck.sh
+
+# For Laptop / General Linux (dynamic detection)
+./scripts/launch_live_laptop.sh
+```
+
+### Script Configuration
+
+Both scripts support environment variable overrides, but defaults differ.
+
+**Common Options:**
+```bash
 # Optional: lower output ring independently (frames)
-PW_AC3_OUTPUT_BUFFER_SIZE=960 ./scripts/launch_live.sh
+PW_AC3_OUTPUT_BUFFER_SIZE=960 ./scripts/launch_live_laptop.sh
 
 # Optional: force a specific physical HDMI sink node
-PW_AC3_TARGET_SINK=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 ./scripts/launch_live.sh
+PW_AC3_TARGET_SINK=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 ./scripts/launch_live_steamdeck.sh
 
 # Optional (loopback-only setups): force app target and link target separately
 PW_AC3_APP_TARGET=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 \
 PW_AC3_CONNECT_TARGET=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 \
-./scripts/launch_live.sh
-
-# Optional: use legacy stdout->pw-play pipeline instead of native PipeWire playback
-PW_AC3_PLAYBACK_MODE=stdout ./scripts/launch_live.sh
-
-# Optional: force direct ALSA fallback when loopback-only sinks are detected
-PW_AC3_DIRECT_ALSA_FALLBACK=1 ./scripts/launch_live.sh
+./scripts/launch_live_laptop.sh
 ```
 
-`launch_live.sh` now defaults to a stability-first profile on Steam Deck:
-- Playback path defaults to native PipeWire mode (`PW_AC3_PLAYBACK_MODE=native`).
-- Direct ALSA fallback is opt-in (`PW_AC3_DIRECT_ALSA_FALLBACK=0` by default).
-- `PW_AC3_NODE_LATENCY=1536/48000` (aligns with AC-3 frame cadence)
-- `PW_AC3_BUFFER_SIZE=6144`
-- `PW_AC3_OUTPUT_BUFFER_SIZE=8192`
-- `PW_AC3_FFMPEG_CHUNK_FRAMES=1536`
-- Input/output buffers are auto-clamped to at least `4x` node latency frames to avoid dropouts.
-- In loopback-only mode, output buffer is auto-raised to `12288` unless `PW_AC3_OUTPUT_BUFFER_SIZE` is explicitly set.
-- If a loopback sink (`alsa_loopback_device...`) is auto-detected, the launcher now switches to the matching physical sink (`alsa_output...`) automatically or fails with a clear error.
-- If only a loopback sink exists, the launcher keeps it as the stream target but attempts port linking via the backing pattern (`alsa_output...`) when available.
-- For strict routing, `connect.sh` now requires exact node-name match by default (substring fallback is disabled unless `PW_AC3_CONNECT_ALLOW_FALLBACK=1`).
+**Steam Deck Specifics (`launch_live_steamdeck.sh`):**
+- **Output Path**: **Direct ALSA** (`aplay` to `hw:0,8`).
+- **Why?**: PipeWire's ALSA sink introduces choppy audio/stuttering on the Deck.
+- **Hardcoded defaults**: Aligns with Valve Dock hardware on Steam Deck.
+- **Behavior**: Takes exclusive control of the HDMI audio device, disables the card profile, configures IEC958 Non-Audio bits, and restores state on exit.
 
-## Fresh Start (Recommended)
-Use this section if you want to reset your setup and start from zero.
+**Laptop/Generic Specifics (`launch_live_laptop.sh`):**
+- **Output Path**: **PipeWire Native** (in-graph playback stream).
+- **Dynamic Detection**: Scans for `pci` sound cards and `hdmi-stereo` sinks.
+- **Lower Latency**: Defaults to `960` buffer size / `64` frames latency for desktop responsiveness.
+- **Profile Auto-Set**: Attempts to find and set `output:hdmi-stereo` profile on the detected card.
 
-### 0) Stop any previous run
-```bash
-pkill -INT -f pw-ac3-live || true
-```
+## Manual Setup
+If you prefer to configure everything manually or need to reset your setup from scratch, see [docs/MANUAL_SETUP.md](docs/MANUAL_SETUP.md).
 
-### 1) Confirm tools
-```bash
-command -v cargo ffmpeg wpctl pw-link pactl
-```
-
-### 2) Build
-```bash
-cargo build --release
-```
-
-### 3) Pick the correct HDMI profile (important)
-`pw-ac3-live` outputs IEC61937/AC-3 payload over a stereo stream. If your card is in
-`hdmi-surround` (or `hdmi-surround71`) profile, AC-3 data is often heard as loud noise.
-
-List cards and active profile:
-```bash
-pactl list cards short
-pactl list cards | rg -n "Name:|Profiles:|Active Profile:|output:hdmi-stereo|output:hdmi-surround"
-```
-
-Set HDMI stereo profile (replace card name if different):
-```bash
-pactl set-card-profile alsa_card.pci-0000_00_1f.3 output:hdmi-stereo+input:analog-stereo
-```
-
-### 4) Find the HDMI sink node name for `--target`
-```bash
-wpctl status
-pactl list sinks short
-```
-
-Use the sink node ending in `hdmi-stereo`, for example:
-- `alsa_output.pci-0000_00_1f.3.hdmi-stereo`
-
-Optional detailed inspect:
-```bash
-wpctl inspect <HDMI_SINK_ID> | rg "node.name|node.description"
-```
-
-### 5) Force HDMI passthrough format to AC3 (critical)
-If this step is skipped, many setups keep route codec at `PCM`, which produces static/noise.
-
-```bash
-# SINK_INDEX comes from `pactl list sinks short` (first column)
-pactl set-sink-formats <SINK_INDEX> 'ac3-iec61937, format.rate = "[ 48000 ]"'
-```
-
-> [!IMPORTANT]
-> **CRITICAL**: The HDMI sink volume must be set to **100% (0dB)**. Any attenuation (even 99%) will modify the bits of the AC-3 stream, causing the receiver to fail decoding and produce loud noise.
-> ```bash
-> pactl set-sink-volume <SINK_INDEX> 100%
-> ```
-
-Optional verification (advanced):
-```bash
-# Route props should show AudioIEC958Codec:AC3 instead of PCM
-pw-cli e <DEVICE_ID> Route | rg "iec958Codecs|AudioIEC958Codec"
-```
-
-### 6) Start `pw-ac3-live`
-```bash
-RUST_LOG=info cargo run --release -- --target alsa_output.pci-0000_00_1f.3.hdmi-stereo \
-  --buffer-size 960 \
-  --latency 32/48000 \
-  --ffmpeg-thread-queue-size 16
-```
-
-### 7) Route app audio into `pw-ac3-live-input`
-The encoder only processes streams that go to the virtual sink `AC-3 Encoder Input`
-(`node.name = pw-ac3-live-input`).
-
-You can route audio in either UI:
-- GNOME Settings -> Sound -> choose `AC-3 Encoder Input` as output device.
-- `pavucontrol` -> Playback tab -> for each app stream, select `AC-3 Encoder Input`.
-
-Or set default sink from CLI:
-```bash
-wpctl status
-# then set default sink to the ID of "AC-3 Encoder Input"
-wpctl set-default <AC3_ENCODER_INPUT_ID>
-```
-
-### 8) Verify graph wiring
-Check routing:
-```bash
-pw-link -l | rg "pw-ac3-live-input:playback_|pw-ac3-live-output:capture_|hdmi-stereo:playback_"
-```
-
-You should see both patterns:
-- `<app>:output_FL/FR -> pw-ac3-live-input:playback_*`
-- `pw-ac3-live-output:capture_* -> <hdmi-stereo-node>:playback_FL/FR`
-
-If the second pattern is missing, link manually:
-```bash
-./scripts/connect.sh alsa_output.pci-0000_00_1f.3.hdmi-stereo
-```
-
-> [!WARNING]
-> **Exclusive Access**: Ensure no other applications (browsers, music players) are playing directly to the HDMI sink. They must play to `AC-3 Encoder Input`. Mixed PCM + AC-3 payload will cause artifacts or silence. Use `pw-link -d` to unlink rogue streams from the HDMI sink.
-> `scripts/connect.sh` now enforces this automatically (`PW_AC3_EXCLUSIVE_HDMI=1` by default). Set `PW_AC3_EXCLUSIVE_HDMI=0` to disable.
-
-### 9) Receiver/TV audio mode
-On AVR/TV, HDMI audio mode must allow compressed bitstream (`Bitstream`, `Auto`, passthrough).
-If forced to `PCM`, AC-3 payload may be decoded as static/noise.
 
 ## Troubleshooting
-### I hear loud noise/static
-Most common causes:
-- HDMI sink volume is **not** 100% (0dB).
-- HDMI card profile is `hdmi-surround` / `hdmi-surround71` instead of `hdmi-stereo`.
-- `--target` points to a surround sink node instead of `...hdmi-stereo`.
-- HDMI sink formats are still `PCM` (route `iec958Codecs` did not switch to `AC3`).
-- AVR/TV is set to PCM instead of bitstream/passthrough.
+For common issues (noise, silence, lag) and their fixes, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
-Fix sequence:
-```bash
-pactl set-card-profile alsa_card.pci-0000_00_1f.3 output:hdmi-stereo+input:analog-stereo
-pactl list sinks short
-pactl set-sink-formats <SINK_INDEX> 'ac3-iec61937, format.rate = "[ 48000 ]"'
-# restart with the hdmi-stereo sink as --target
-RUST_LOG=info cargo run --release -- --target <your-hdmi-stereo-node>
-```
-
-### I hear nothing
-Check in order:
-1. Encoder input is not being fed by apps.
-2. `pw-ac3-live-output` is not linked to HDMI sink (Auto-link failed).
-3. Other apps are hogging the HDMI sink (Exclusive access required).
-4. Launcher selected a loopback sink (`alsa_loopback_device...`) instead of a physical `alsa_output...hdmi-stereo` sink.
-5. Volumes/mute in `wpctl status`.
-
-Fix:
-```bash
-# Inspect sink candidates
-pactl list sinks short | rg hdmi
-
-# Force a physical HDMI sink if auto-detection picked loopback
-PW_AC3_TARGET_SINK=<alsa_output...hdmi-stereo sink> ./scripts/launch_live.sh
-
-# Force link
-./scripts/connect.sh <hdmi-sink-name>
-# Unlink others (example)
-pw-link -d Firefox:output_FL <hdmi-sink-name>:playback_FL
-```
-
-Useful commands:
-```bash
-wpctl status
-pw-link -l
-```
-
-### Audio is laggy and choppy (Steam Deck)
-Try this balanced launcher profile first:
-```bash
-PW_AC3_BUFFER_SIZE=3072 \
-PW_AC3_OUTPUT_BUFFER_SIZE=6144 \
-PW_AC3_NODE_LATENCY=1536/48000 \
-PW_AC3_FFMPEG_THREAD_QUEUE_SIZE=32 \
-PW_AC3_FFMPEG_CHUNK_FRAMES=1536 \
-./scripts/launch_live.sh
-```
-
-If audio is still choppy, increase only output buffering:
-```bash
-PW_AC3_OUTPUT_BUFFER_SIZE=8192 ./scripts/launch_live.sh
-```
-
-Notes:
-- `launch_live.sh` now moves existing sink-input streams to `pw-ac3-live-input`, so apps started before the script are less likely to corrupt HDMI AC-3 passthrough.
-- `latency[pipewire] playback.underruns` should remain near zero; if it climbs quickly, increase `PW_AC3_OUTPUT_BUFFER_SIZE`.
-- If `playback.queue_delay_ms` stays near ~20 ms with frequent underruns, keep `PW_AC3_NODE_LATENCY=1536/48000` and increase only `PW_AC3_OUTPUT_BUFFER_SIZE` (`8192`, then `12288`).
-
-### Audio drops or glitches
-Increase ring buffer size:
-```bash
-cargo run --release -- --target <your-hdmi-stereo-node> --buffer-size 9600
-```
-
-If latency is too high, reduce in this order until stable:
-```bash
-# 1) lower buffer size
---buffer-size 960
-# 2) lower PipeWire latency target
---latency 32/48000
-# 3) keep FFmpeg queue small
---ffmpeg-thread-queue-size 16
-```
-
-If you get silence after aggressive tuning, move back to stable values first:
-```bash
---buffer-size 4800 --latency 64/48000 --ffmpeg-thread-queue-size 128
-```
-
-### Sound is stereo only / All channels come from Front Speakers
-If you hear surround content mixed down to your front speakers:
-1. **Check Receiver Mode**: Ensure your AVR/Soundbar is in "Surround", "Dolby Digital", or "Straight" mode, not "Stereo" or "2ch".
-2. **Verify Input**: Run the included verification script to test each channel independently:
-   ```bash
-   ./scripts/test_surround_sequential.sh
-   ```
-   If you hear the tones move correctly, the system is working, and your source application (e.g., Browser) is likely sending Stereo audio. This is normal behavior for stereo content (it is not upmixed by default).
-
-## Return to Normal Desktop Audio
-When done testing:
-```bash
-# Stop encoder (Ctrl+C in the running terminal)
-
-wpctl status
-# set default sink back to your regular HDMI/analog sink
-wpctl set-default <REGULAR_SINK_ID>
-```
-
-In `pavucontrol`, move app streams back to your normal output device if needed.
 
 ## Runtime nodes
 - Input node: `pw-ac3-live-input` (PipeWire sink, 6 channels, F32LE)
@@ -326,42 +127,8 @@ The capture side supports both layouts commonly exposed by PipeWire:
 - multi-buffer planar input.
 
 ## Testing
-```bash
-# Full test suite
-cargo test
+For detailed testing instructions, including automated tests and local pipelines, see [docs/TESTING.md](docs/TESTING.md).
 
-# Encoder-focused tests
-cargo test --test encoder_tests
-
-# PipeWire client behavior and parsing tests
-cargo test --test pipewire_client_tests
-```
-
-Notable regression coverage includes:
-- encoder shutdown under output backpressure,
-- safe F32 parsing for planar and interleaved capture buffers (alignment/range assumptions),
-- playback target resolution (`--target` numeric/name),
-- stdout output loop shutdown behavior.
-
-For end-to-end local verification, see `docs/TESTING.md`.
-
-Quick integration scripts:
-```bash
-# Stdout pipeline + sink monitor capture (intermediate IEC validation)
-./scripts/test_local_pipeline.sh
-
-# Native PipeWire playback stream + direct output capture (strict IEC validation)
-./scripts/test_pipewire_pipeline.sh
-```
-
-In local script output, `output.spdif` is captured from sink monitor/mix path and may not preserve
-IEC sync words. `intermediate.raw` is the authoritative encoder bitstream artifact.
-
-## Manual output connection helper
-If you want to connect output ports manually from the shell:
-```bash
-./scripts/connect.sh <target-node-name-pattern>
-```
 
 ## License
 MIT / Apache-2.0
