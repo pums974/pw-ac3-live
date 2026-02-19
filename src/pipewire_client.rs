@@ -22,7 +22,6 @@ const SAMPLE_RATE_HZ: u32 = 48_000;
 const STDOUT_READ_BUFFER_SIZE: usize = 4096;
 const OUTPUT_FRAME_BYTES: usize = OUTPUT_CHANNELS * size_of::<i16>();
 
-
 #[derive(Debug, Clone)]
 pub struct PipewireConfig {
     pub node_latency: String,
@@ -35,8 +34,6 @@ impl Default for PipewireConfig {
         }
     }
 }
-
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlaybackTarget {
@@ -300,7 +297,6 @@ pub fn run_pipewire_loop_with_config(
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|frames| *frames > 0);
 
-
     pw::init();
 
     let mainloop = MainLoop::new(None)?;
@@ -370,7 +366,6 @@ pub fn run_pipewire_loop_with_config(
             match stream.dequeue_buffer() {
                 None => (),
                 Some(mut buffer) => {
-
                     let datas = buffer.datas_mut();
                     if datas.is_empty() {
                         return;
@@ -477,7 +472,6 @@ pub fn run_pipewire_loop_with_config(
                     }
 
                     if let Ok(mut producer) = data.try_lock() {
-
                         let writable = producer.slots().min(interleaved_scratch.len());
                         let frame_aligned_writable = writable - (writable % INPUT_CHANNELS);
                         let dropped_frames = ((interleaved_scratch
@@ -505,8 +499,6 @@ pub fn run_pipewire_loop_with_config(
                     } else {
                         (interleaved_scratch.len() / INPUT_CHANNELS) as u64
                     };
-
-
                 }
             }
         })
@@ -553,7 +545,10 @@ pub fn run_pipewire_loop_with_config(
             if ret > 0 {
                 info!("Shrunk process stdout pipe from {} to {} bytes", old, ret);
             } else {
-                log::warn!("Could not shrink process stdout pipe: {}", std::io::Error::last_os_error());
+                log::warn!(
+                    "Could not shrink process stdout pipe: {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
 
@@ -639,13 +634,13 @@ pub fn run_pipewire_loop_with_config(
                 move |stream: &StreamRef, _data| match stream.dequeue_buffer() {
                     None => (),
                     Some(mut buffer) => {
-    
+
                         let datas = buffer.datas_mut();
                         if datas.is_empty() {
                             return;
                         }
 
-    
+
                         let (to_write, _) = {
                             let Some(raw_data) = datas[0].data() else {
                                 return;
@@ -686,7 +681,7 @@ pub fn run_pipewire_loop_with_config(
                             let prefill_target = target_write.min(prefill_limit);
                             if let Ok(mut consumer) = output_data.try_lock() {
                                 let available = consumer.slots();
-       
+
 
                                 if !playback_primed.load(Ordering::Relaxed) {
                                     if available >= prefill_target {
@@ -768,9 +763,6 @@ pub fn run_pipewire_loop_with_config(
         .into_result()?;
 
     mainloop.run();
-
-
-
 
     Ok(())
 }

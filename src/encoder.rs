@@ -3,7 +3,10 @@ use log::{error, info, warn};
 use rtrb::{Consumer, Producer};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -60,8 +63,6 @@ impl Default for EncoderConfig {
     }
 }
 
-
-
 /// Manages the FFmpeg subprocess for encoding.
 ///
 /// Spawns `ffmpeg`, creates one thread to feed it audio from `input_consumer`,
@@ -99,38 +100,48 @@ pub fn run_encoder_loop_with_config(
     // The byte stream from stdout will be S16LE PCM frames essentially.
 
     let mut command = Command::new("ffmpeg");
-    
+
     // Global / Demuxer Flags MUST come before input
     command.args([
         "-y",
-        "-probesize", "32", 
-        "-analyzeduration", "0",
-        "-fflags", "+nobuffer",
-        "-flags", "+low_delay",
+        "-probesize",
+        "32",
+        "-analyzeduration",
+        "0",
+        "-fflags",
+        "+nobuffer",
+        "-flags",
+        "+low_delay",
         // Input Format
-        "-f", "f32le",
-        "-ar", "48000",
-        "-ac", "6",
-        "-thread_queue_size", ffmpeg_thread_queue_size_arg.as_str(),
-        "-i", "pipe:0", // Input
+        "-f",
+        "f32le",
+        "-ar",
+        "48000",
+        "-ac",
+        "6",
+        "-thread_queue_size",
+        ffmpeg_thread_queue_size_arg.as_str(),
+        "-i",
+        "pipe:0", // Input
     ]);
 
     command.args([
-        "-c:a", "ac3",
-        "-b:a", "640k", 
-        "-bufsize", "0", 
-        "-f", "spdif", 
+        "-c:a", "ac3", "-b:a", "640k", "-bufsize", "0", "-f", "spdif",
     ]);
 
     // Muxer / Output flags
     command.args([
-        "-flush_packets", "1",
-        "-muxdelay", "0",
-        "-muxpreload", "0",
-        "-avioflags", "direct",
+        "-flush_packets",
+        "1",
+        "-muxdelay",
+        "0",
+        "-muxpreload",
+        "0",
+        "-avioflags",
+        "direct",
         "pipe:1", // Output
     ]);
-    
+
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -155,12 +166,11 @@ pub fn run_encoder_loop_with_config(
         shrink_pipe_buffer(stdout.as_raw_fd(), "ffmpeg-stdout");
     }
 
-
     let running_feeder = running.clone();
     let output_capacity = output.slots();
     // Keep read chunks small enough to avoid bursty output->playback pressure.
-    let mut stdout_read_buffer_size = (output_capacity / 8)
-        .clamp(MIN_STDOUT_READ_BUFFER_SIZE, MAX_STDOUT_READ_BUFFER_SIZE);
+    let mut stdout_read_buffer_size =
+        (output_capacity / 8).clamp(MIN_STDOUT_READ_BUFFER_SIZE, MAX_STDOUT_READ_BUFFER_SIZE);
     stdout_read_buffer_size -= stdout_read_buffer_size % OUTPUT_FRAME_BYTES_U8;
     if stdout_read_buffer_size == 0 {
         stdout_read_buffer_size = OUTPUT_FRAME_BYTES_U8;
@@ -169,8 +179,6 @@ pub fn run_encoder_loop_with_config(
         "FFmpeg stdout read chunk size: {} bytes (output ring capacity: {} bytes)",
         stdout_read_buffer_size, output_capacity
     );
-
-
 
     // Spawn Feeder Thread (RingBuffer -> Stdin)
     let feeder_handle = thread::spawn(move || -> Result<()> {
@@ -184,7 +192,6 @@ pub fn run_encoder_loop_with_config(
                 if let Ok(chunk) =
                     input.read_chunk(readable_samples.min(feeder_chunk_frames * INPUT_CHANNELS))
                 {
-
                     // Copy to local buffer
                     byte_buffer.clear();
                     for sample in chunk {
@@ -195,19 +202,21 @@ pub fn run_encoder_loop_with_config(
                     // Write to stdin
                     if let Err(e) = stdin.write_all(&byte_buffer) {
                         if running_feeder.load(Ordering::Relaxed) {
-                            return Err(anyhow::Error::new(e).context("Failed to write to ffmpeg stdin"));
+                            return Err(
+                                anyhow::Error::new(e).context("Failed to write to ffmpeg stdin")
+                            );
                         }
                         break;
                     }
                     // Force flush to prevent buffering in the pipe
                     if let Err(e) = stdin.flush() {
                         if running_feeder.load(Ordering::Relaxed) {
-                            return Err(anyhow::Error::new(e).context("Failed to flush ffmpeg stdin"));
+                            return Err(
+                                anyhow::Error::new(e).context("Failed to flush ffmpeg stdin")
+                            );
                         }
                         break;
                     }
-
-
                 } else {
                     thread::sleep(Duration::from_micros(250));
                 }
@@ -240,7 +249,6 @@ pub fn run_encoder_loop_with_config(
                 let mut bytes_written = 0;
                 let mut abort_due_to_shutdown_backpressure = false;
 
-
                 while bytes_written < n {
                     if output.slots() > 0 {
                         let request = (n - bytes_written).min(output.slots());
@@ -261,7 +269,6 @@ pub fn run_encoder_loop_with_config(
                                     break;
                                 }
                                 thread::sleep(Duration::from_micros(100));
-        
                             }
                         }
                     } else {
@@ -270,11 +277,8 @@ pub fn run_encoder_loop_with_config(
                             break;
                         }
                         thread::sleep(Duration::from_micros(250));
-
                     }
                 }
-
-
 
                 if abort_due_to_shutdown_backpressure {
                     break;
@@ -283,7 +287,8 @@ pub fn run_encoder_loop_with_config(
             Err(e) => {
                 if running.load(Ordering::Relaxed) {
                     error!("Error reading ffmpeg stdout: {}", e);
-                    reader_error = Some(anyhow::Error::new(e).context("Error reading ffmpeg stdout"));
+                    reader_error =
+                        Some(anyhow::Error::new(e).context("Error reading ffmpeg stdout"));
                 }
                 break;
             }
@@ -320,8 +325,9 @@ pub fn run_encoder_loop_with_config(
             }
             Err(e) => {
                 if reader_error.is_none() {
-                    reader_error =
-                        Some(anyhow::Error::new(e).context("Failed to query ffmpeg process status"));
+                    reader_error = Some(
+                        anyhow::Error::new(e).context("Failed to query ffmpeg process status"),
+                    );
                 }
                 forced_kill = true;
                 let _ = child.kill();
@@ -329,8 +335,6 @@ pub fn run_encoder_loop_with_config(
             }
         }
     };
-
-
 
     if running.load(Ordering::Relaxed) {
         if let Some(err) = reader_error {
@@ -350,5 +354,3 @@ pub fn run_encoder_loop_with_config(
 
     Ok(())
 }
-
-
