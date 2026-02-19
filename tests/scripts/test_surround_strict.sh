@@ -1,4 +1,7 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}/../.."
+
 # test_surround_strict.sh
 # Forces 1:1 mapping of mono signals to specific 5.1 channels on pw-ac3-live-input
 

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}/../.."
+
 # Latency isolation test: bypass pw-ac3-live entirely.
 # Plays a raw sine-wave beep directly through aplay to the HDMI device.
 # If you hear the beep with multi-second delay, the latency is in ALSA/HDMI/AVR,
 # NOT in pw-ac3-live.
 #
-# Usage: ./scripts/test_alsa_latency.sh [hw:0,8]
+# Usage: ./tests/scripts/test_alsa_latency.sh [hw:0,8]
 
 set -euo pipefail
 

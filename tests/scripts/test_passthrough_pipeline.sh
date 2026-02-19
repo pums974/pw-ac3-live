@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}/../.."
+
 # Passthrough Latency Test
 # 
 # 1. Launches pw-ac3-live in PASSTHROUGH mode (No FFmpeg, no AC-3).

@@ -1,5 +1,8 @@
 #!/bin/bash
 set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}/../.."
+
 
 # ID of the card (usually 0 for Generic)
 CARD_NAME="alsa_card.pci-0000_04_00.1"

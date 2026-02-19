@@ -95,14 +95,3 @@ The project splits launch logic into two distinct scripts, each implementing the
     *   Dynamic scanning for PCI sound cards and `hdmi-stereo` sinks.
     *   Low-latency defaults (`64` frames) for responsive desktop usage.
     *   Standard `pactl` profile switching logic.
-
-## Latency Considerations
-*   **Buffering**: The RingBuffer must be large enough to absorb jitter between the RT thread and the Encoder thread, but small enough to minimize AV sync issues. 
-*   **Target**: < 50ms total system latency.
-
-## Testing Strategy
-*   **Encoder Tests**: `tests/encoder_tests.rs` validates throughput, restart/shutdown behavior, IEC61937 preamble presence, and shutdown under output backpressure.
-*   **PipeWire Client Tests**: `tests/pipewire_client_tests.rs` validates safe audio buffer parsing, playback target resolution, and stdout loop shutdown semantics.
-*   **Local End-to-End Script**: `scripts/test_local_pipeline.sh` validates encoder output and graph wiring with a null sink plus monitor capture.
-*   **Native End-to-End Script**: `scripts/test_pipewire_pipeline.sh` validates strict IEC61937 presence from the native `pw-ac3-live-output` stream.
-*   **CI**: GitHub Actions validates the build, formatting, and unit tests on every commit.

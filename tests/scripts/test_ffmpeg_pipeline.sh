@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}/../.."
+
 # Synthetic Pipeline Test: FFmpeg (Generator) -> Output Chain -> Hardware
 #
 # This tests the encoding and output latency WITHOUT PipeWire capture.
 # It runs FFmpeg generating beep tones, piped through the EXACT same
 # output chain as the main app (reduce_pipe_latency.py -> aplay).
 #
-# Usage: ./scripts/test_ffmpeg_pipeline.sh [hw:0,8]
+# Usage: ./tests/scripts/test_ffmpeg_pipeline.sh [hw:0,8]
 
 set -euo pipefail
 

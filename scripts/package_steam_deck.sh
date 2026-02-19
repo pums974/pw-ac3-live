@@ -42,6 +42,8 @@ mkdir -p "${PKG_DIR}/bin"
 
 cp "${BIN_PATH}" "${PKG_DIR}/bin/${APP_NAME}"
 cp -r "${REPO_ROOT}/scripts" "${PKG_DIR}/"
+mkdir -p "${PKG_DIR}/tests"
+cp -r "${REPO_ROOT}/tests/scripts" "${PKG_DIR}/tests/"
 cp "${REPO_ROOT}/README.md" "${PKG_DIR}/README.md"
 
 cat > "${PKG_DIR}/run.sh" <<'EOF'

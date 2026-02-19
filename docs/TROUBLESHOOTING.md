@@ -87,7 +87,7 @@ PW_AC3_OUTPUT_BUFFER_SIZE=6144 ./scripts/launch_live_steamdeck.sh
 ### Verification
 Run the channel test script to confirm if the **encoder** is working correctly:
 ```bash
-./scripts/test_surround_sequential.sh
+./tests/scripts/test_surround_sequential.sh
 ```
 - If this test plays correctly on all speakers, the encoder pipeline is **fine**.
 - The issue is likely your source app (e.g., Browser) or Windows game running in Proton not configured for 5.1.
