@@ -22,11 +22,11 @@ To ensure glitch-free audio, we strictly separate real-time (RT) tasks from comp
 *   **Context**: PipeWire `process` callback.
 *   **Priority**: Real-time (SCHED_FIFO).
 *   **Graph Node**: Creates `pw-ac3-live-input` (Virtual 5.1 Sink to other apps).
-*   **Constraints**: 
+*   **Constraints**:
     *   Avoid blocking operations.
     *   Avoid long critical sections.
     *   Keep callback work bounded to prevent xruns.
-*   **Responsibility**: 
+*   **Responsibility**:
     *   Read 6-channel capture input (`F32LE`) from PipeWire buffers.
     *   Parse either:
         * single interleaved buffer (`datas=1`, stride-based), or

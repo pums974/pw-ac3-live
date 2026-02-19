@@ -231,7 +231,7 @@ fn test_encoder_valid_iec61937() {
     // Simple naive search
     if data.len() >= 4 {
         for i in 0..data.len() - 4 {
-            if &data[i..i + 4] == &preamble {
+            if data[i..i + 4] == preamble {
                 found = true;
                 break;
             }
@@ -404,7 +404,7 @@ fn test_encoder_zero_config_values() {
 
     let silence = vec![0.0f32; 48000];
     if let Ok(chunk) = input_producer.write_chunk_uninit(silence.len()) {
-        chunk.fill_from_iter(silence.into_iter());
+        chunk.fill_from_iter(silence);
     }
 
     let start = Instant::now();
@@ -565,7 +565,7 @@ fn test_encoder_multiple_iec61937_frames() {
     let mut count = 0;
     if data.len() >= 4 {
         for i in 0..data.len() - 3 {
-            if &data[i..i + 4] == &preamble {
+            if data[i..i + 4] == preamble {
                 count += 1;
             }
         }
@@ -628,7 +628,7 @@ fn test_encoder_iec61937_frame_spacing() {
     let mut positions = Vec::new();
     if data.len() >= 4 {
         for i in 0..data.len() - 3 {
-            if &data[i..i + 4] == &preamble {
+            if data[i..i + 4] == preamble {
                 positions.push(i);
             }
         }

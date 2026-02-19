@@ -15,8 +15,8 @@ APP_NAME="pw-ac3-live"
 APP_VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "${REPO_ROOT}/Cargo.toml")"
 
 if [[ -z "${APP_VERSION}" ]]; then
-    echo "Failed to detect version from Cargo.toml" >&2
-    exit 1
+  echo "Failed to detect version from Cargo.toml" >&2
+  exit 1
 fi
 
 DIST_DIR="${REPO_ROOT}/dist"
@@ -25,15 +25,15 @@ ARCHIVE_PATH="${DIST_DIR}/${APP_NAME}-steamdeck-${APP_VERSION}.tar.gz"
 
 echo "==> Building ${APP_NAME} (${BUILD_PROFILE}) for ${TARGET_TRIPLE}"
 if [[ "${BUILD_PROFILE}" == "release" ]]; then
-    cargo build --release --target "${TARGET_TRIPLE}"
+  cargo build --release --target "${TARGET_TRIPLE}"
 else
-    cargo build --profile "${BUILD_PROFILE}" --target "${TARGET_TRIPLE}"
+  cargo build --profile "${BUILD_PROFILE}" --target "${TARGET_TRIPLE}"
 fi
 
 BIN_PATH="${REPO_ROOT}/target/${TARGET_TRIPLE}/${BUILD_PROFILE}/${APP_NAME}"
 if [[ ! -x "${BIN_PATH}" ]]; then
-    echo "Built binary not found at ${BIN_PATH}" >&2
-    exit 1
+  echo "Built binary not found at ${BIN_PATH}" >&2
+  exit 1
 fi
 
 echo "==> Staging package at ${PKG_DIR}"
@@ -46,7 +46,7 @@ mkdir -p "${PKG_DIR}/tests"
 cp -r "${REPO_ROOT}/tests/scripts" "${PKG_DIR}/tests/"
 cp "${REPO_ROOT}/README.md" "${PKG_DIR}/README.md"
 
-cat > "${PKG_DIR}/run.sh" <<'EOF'
+cat > "${PKG_DIR}/run.sh" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,7 +54,7 @@ export PATH="${SCRIPT_DIR}/bin:${PATH}"
 exec "${SCRIPT_DIR}/bin/pw-ac3-live" "$@"
 EOF
 
-cat > "${PKG_DIR}/STEAM_DECK_NOTES.txt" <<'EOF'
+cat > "${PKG_DIR}/STEAM_DECK_NOTES.txt" << 'EOF'
 Runtime requirements on Steam Deck:
 - ffmpeg
 - PipeWire + WirePlumber (default on SteamOS desktop mode)

@@ -1,0 +1,59 @@
+minimum_pre_commit_version: "3.6.0"
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+
+  - repo: local
+    hooks:
+      - id: shfmt
+        name: shfmt (bash scripts)
+        entry: shfmt -w -i 2 -ci -bn -sr
+        language: system
+        types: [shell]
+
+      - id: shellcheck
+        name: shellcheck (bash scripts)
+        entry: shellcheck
+        args: ["-S", "error"]
+        language: system
+        types: [shell]
+
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+        files: "(^src/.*\\.rs$)|(^tests/.*\\.rs$)|(^Cargo\\.(toml|lock)$)"
+
+      - id: cargo-clippy
+        name: cargo clippy (deny warnings)
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        pass_filenames: false
+        require_serial: true
+        files: "(^src/.*\\.rs$)|(^tests/.*\\.rs$)|(^Cargo\\.(toml|lock)$)"
+
+      - id: cargo-test
+        name: cargo test (pre-push)
+        entry: cargo test --all-targets
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        require_serial: true
+        files: "(^src/.*\\.rs$)|(^tests/.*\\.rs$)|(^Cargo\\.(toml|lock)$)"

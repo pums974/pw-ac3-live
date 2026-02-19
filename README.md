@@ -13,7 +13,7 @@ The encoded stream is delivered through one of two possible output paths:
 - **PipeWire Native** — plays back through a PipeWire output source node within the graph. Used on standard Linux desktops.
 - **Direct ALSA** — pipes the encoded stream to `aplay` for exclusive hardware access, bypassing the PipeWire graph entirely. Used on platforms like the Steam Deck where PipeWire's ALSA sink plugin introduces unacceptable stuttering or scheduling jitter for encoded bitstreams.
 
-This project has only been tested on the following path: 
+This project has only been tested on the following path:
 * Steam Deck → Valve Dock → HDMI → LG C4 TV → Optical (SPDIF) → Sony DAV-DZ340 (5.1) (uses `scripts/launch_live_steamdeck.sh`)
 * Archlinux laptop → HDMI → LG C4 TV → Optical (SPDIF) → Sony DAV-DZ340 (5.1) (uses `scripts/launch_live_laptop.sh`)
 

@@ -23,6 +23,7 @@ Refer to `.agent/skills/` for standardized workflows. **Use these skills in prio
 - **Research**: `research` (using Context7 and Web effectively)
 - **PipeWire Ops**: `pw_operator` (running/debugging on Laptop vs Steam Deck)
 - **SSH**: `ssh` (remote execution on Steam Deck)
+- **Pre-commit**: `pre_commit` (formatting, linting, local quality gates via pre-commit)
 
 ## Architecture & Output Paths
 The application supports two distinct output paths. You must understand the difference:
@@ -51,10 +52,10 @@ The application supports two distinct output paths. You must understand the diff
 
 ## Constraints & Behaviors
 - **Real-time Safety**: NEVER allocate memory, lock blocking mutexes, or perform I/O in the `process()` callback. Use `rtrb` for lock-free communication.
-- **Error Handling**: 
+- **Error Handling**:
     - `anyhow` for top-level application errors.
     - **No Panics** in the audio thread. Handle underruns (silence/repeat) gracefully.
-- **Dependencies**: 
+- **Dependencies**:
     - `pipewire` (IPC)
     - `ffmpeg-next` (AC-3 Encoding)
     - `rtrb` (Ring buffer)
