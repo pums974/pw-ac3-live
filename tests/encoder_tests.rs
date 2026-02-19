@@ -251,13 +251,13 @@ fn test_encoder_restart() {
             encoder::run_encoder_loop(input_consumer, output_producer, encoder_running)
         });
 
-        // Feed some data
-        let silence = vec![0.0f32; 4800];
+        // Feed some data - increased to 1s to ensure output
+        let silence = vec![0.0f32; 48000];
         if let Ok(chunk) = input_producer.write_chunk_uninit(silence.len()) {
             chunk.fill_from_iter(silence.into_iter());
         }
 
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(200));
         running.store(false, Ordering::SeqCst);
         let result = encoder_handle.join();
         assert!(result.is_ok(), "Encoder failed to join on iteration {}", i);
