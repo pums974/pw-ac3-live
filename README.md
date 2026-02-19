@@ -2,14 +2,16 @@
 
 `pw-ac3-live` is a real-time 5.1 LPCM to AC-3 (Dolby Digital) encoder for PipeWire/ALSA.
 
+This project is only a proof of concept and is not intended for production use.
+This project has been completely vibe-coded with AI.
+I only have a limited knowledge of the tools used in this project (Rust, PipeWire, ALSA, ffmpeg) and in audio engineering in general.
+
 ## Purpose
 Some HDMI sinks expose only stereo PCM but still accept AC-3 passthrough. This project creates a virtual 5.1 sink, encodes incoming audio to AC-3 with `ffmpeg`, and outputs an IEC61937 stream for playback.
 
 The encoded stream is delivered through one of two co-equal output paths:
 - **PipeWire Native** — plays back through a PipeWire output source node within the graph. Used on standard Linux desktops.
 - **Direct ALSA** — pipes the encoded stream to `aplay` for exclusive hardware access, bypassing the PipeWire graph entirely. Used on platforms like the Steam Deck where PipeWire's ALSA sink plugin introduces unacceptable stuttering or scheduling jitter for encoded bitstreams.
-
-This project is only a proof of concept and is not intended for production use.
 
 This project has only been tested on the following path: 
 * Steam Deck → Valve Dock → HDMI → LG C4 TV → Optical (SPDIF) → Sony DAV-DZ340 (5.1) (uses `scripts/launch_live_steamdeck.sh`)
