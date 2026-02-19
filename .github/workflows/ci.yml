@@ -49,3 +49,67 @@ jobs:
 
     - name: Run Tests
       run: cargo test --verbose
+
+  integration:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          pkg-config \
+          libclang-dev \
+          libpipewire-0.3-dev \
+          libspa-0.2-dev \
+          ffmpeg \
+          pipewire \
+          pipewire-pulse \
+          wireplumber \
+          pipewire-audio-client-libraries \
+          dbus-x11 \
+          python3
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust Build
+      uses: Swatinem/rust-cache@v2
+
+    - name: Run Integration Test
+      run: |
+        export XDG_RUNTIME_DIR="/tmp/xdg-runtime-ci"
+        mkdir -p "$XDG_RUNTIME_DIR"
+        chmod 0700 "$XDG_RUNTIME_DIR"
+
+        # Start PipeWire stack inside a private D-Bus session
+        dbus-run-session bash -c '
+          set -euo pipefail
+
+          # Start PipeWire daemon
+          pipewire &
+          PW_PID=$!
+          sleep 1
+
+          # Start WirePlumber session manager
+          wireplumber &
+          WP_PID=$!
+          sleep 1
+
+          # Start PipeWire-Pulse compatibility layer (provides pactl)
+          pipewire-pulse &
+          PP_PID=$!
+          sleep 1
+
+          echo "PipeWire stack started (pw=$PW_PID wp=$WP_PID pp=$PP_PID)"
+          pw-cli info 0 || { echo "PipeWire not responding"; exit 1; }
+
+          # Run the integration test
+          bash tests/scripts/test_ci_pipeline.sh
+
+          # Cleanup
+          kill $PP_PID $WP_PID $PW_PID 2>/dev/null || true
+        '
