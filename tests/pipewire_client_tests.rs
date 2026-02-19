@@ -330,9 +330,7 @@ mod pipewire_client_impl {
 
             let (mut producer, mut consumer) = RingBuffer::<u8>::new(32);
             {
-                let chunk = producer
-                    .write_chunk_uninit(4)
-                    .expect("should have space");
+                let chunk = producer.write_chunk_uninit(4).expect("should have space");
                 chunk.fill_from_iter([1u8, 2, 3, 4].iter().copied());
             }
 
@@ -340,6 +338,61 @@ mod pipewire_client_impl {
             let mut writer = FailWriter;
             let result = run_stdout_output_loop(&mut consumer, &running, &mut writer);
             assert!(result.is_err());
+        }
+
+        // ── parse_f32_plane offset handling ───────────────────────────
+
+        #[test]
+        fn parse_f32_plane_with_nonzero_offset() {
+            // Place 2 padding bytes then 2 f32 samples at offset 8 (aligned).
+            let mut bytes = vec![0u8; 8]; // 8 bytes of padding
+            bytes.extend_from_slice(&1.5f32.to_le_bytes());
+            bytes.extend_from_slice(&(-2.5f32).to_le_bytes());
+
+            let parsed = parse_f32_plane(&bytes, 8, 8).expect("offset 8 should parse");
+            assert_eq!(parsed, vec![1.5, -2.5]);
+        }
+
+        // ── parse_f32_interleaved happy path ──────────────────────────
+
+        #[test]
+        fn parse_f32_interleaved_exact_frame_count() {
+            // 6 samples = exactly 2 frames of 3 channels. No truncation needed.
+            let samples = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+            let mut bytes = Vec::with_capacity(samples.len() * size_of::<f32>());
+            for sample in samples {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+
+            let parsed = parse_f32_interleaved(&bytes, 0, bytes.len(), 3)
+                .expect("exact frame count should parse");
+            assert_eq!(parsed, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        }
+
+        // ── parse_interleaved_from_stride with offset ─────────────────
+
+        #[test]
+        fn stride_nonzero_offset() {
+            // 8 bytes of padding, then 2 stereo f32 frames at offset 8.
+            let mut bytes = vec![0u8; 8]; // padding
+            for val in [0.25f32, -0.25f32, 0.75f32, -0.75f32] {
+                bytes.extend_from_slice(&val.to_le_bytes());
+            }
+
+            let parsed =
+                parse_interleaved_from_stride(&bytes, 8, 16, 8).expect("offset 8 should parse");
+            assert_eq!(parsed.len(), 12); // 2 frames × 6 channels
+            assert_eq!(parsed[0], 0.25);
+            assert_eq!(parsed[1], -0.25);
+            assert_eq!(parsed[2], 0.0); // padded
+            assert_eq!(parsed[6], 0.75);
+        }
+
+        #[test]
+        fn stride_offset_overflow_returns_none() {
+            let bytes = vec![0u8; 16];
+            // offset + size overflows usize via checked_add.
+            assert!(parse_interleaved_from_stride(&bytes, usize::MAX, 1, 4).is_none());
         }
     }
 }

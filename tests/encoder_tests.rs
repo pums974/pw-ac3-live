@@ -344,7 +344,12 @@ fn test_encoder_custom_config() {
     };
 
     let encoder_handle = thread::spawn(move || {
-        encoder::run_encoder_loop_with_config(input_consumer, output_producer, encoder_running, config)
+        encoder::run_encoder_loop_with_config(
+            input_consumer,
+            output_producer,
+            encoder_running,
+            config,
+        )
     });
 
     // Feed 0.5s of silence
@@ -389,7 +394,12 @@ fn test_encoder_zero_config_values() {
     };
 
     let encoder_handle = thread::spawn(move || {
-        encoder::run_encoder_loop_with_config(input_consumer, output_producer, encoder_running, config)
+        encoder::run_encoder_loop_with_config(
+            input_consumer,
+            output_producer,
+            encoder_running,
+            config,
+        )
     });
 
     let silence = vec![0.0f32; 48000];
@@ -561,7 +571,11 @@ fn test_encoder_multiple_iec61937_frames() {
         }
     }
 
-    println!("Found {} IEC 61937 preambles in {} bytes", count, data.len());
+    println!(
+        "Found {} IEC 61937 preambles in {} bytes",
+        count,
+        data.len()
+    );
     assert!(
         count >= 10,
         "Expected ≥10 IEC 61937 frames for 2s of audio, found {}",
@@ -638,3 +652,16 @@ fn test_encoder_iec61937_frame_spacing() {
     }
 }
 
+#[test]
+fn test_encoder_config_default_values() {
+    let config = encoder::EncoderConfig::default();
+    assert_eq!(config.ffmpeg_thread_queue_size, 128);
+    assert_eq!(config.feeder_chunk_frames, 128);
+}
+
+#[test]
+fn test_pipewire_config_default_values() {
+    use pw_ac3_live::pipewire_client::PipewireConfig;
+    let config = PipewireConfig::default();
+    assert_eq!(config.node_latency, "64/48000");
+}
