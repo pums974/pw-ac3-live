@@ -21,7 +21,7 @@ scp -r dist/pw-ac3-live-steamdeck-0.1.0 steamdeck:/home/deck/Downloads/
 **2. Run via SSH:**
 **CRITICAL**: Use `-t` to allocate a pseudo-terminal. This ensures signals (Ctrl+C) are correctly propagated to stop the application cleanly.
 ```bash
-ssh -t -- steamdeck /home/deck/Downloads/pw-ac3-live-steamdeck-0.1.0/scripts/launch_live_steamdeck.sh
+ssh -t -- steamdeck "/home/deck/Downloads/pw-ac3-live-steamdeck-0.1.0/scripts/launch_live_steamdeck.sh"
 ```
 
 **Notes**:

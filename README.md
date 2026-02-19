@@ -21,7 +21,8 @@ This project has only been tested on the following path:
 - Rust toolchain
 - PipeWire
 - `ffmpeg` binary with AC-3 encoder and `spdif` muxer support
-- PipeWire CLI tools for local testing (`pw-play`, `pw-record`, `pw-link`, `pw-cli`, `pactl`)
+- PipeWire CLI tools for testing (`pw-play`, `pw-record`, `pw-link`, `pw-cli`, `pactl`)
+- ALSA CLI tools for testing (`alsa-utils`)
 
 ## Build
 ```bash
