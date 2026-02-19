@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Install System Dependencies
       run: |
@@ -31,12 +31,12 @@ jobs:
           ffmpeg
 
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
+      uses: dtolnay/rust-toolchain@stable
       with:
-        profile: minimal
-        toolchain: stable
-        override: true
         components: rustfmt, clippy
+
+    - name: Cache Rust Build
+      uses: Swatinem/rust-cache@v2
 
     - name: Check Formatting
       run: cargo fmt -- --check
