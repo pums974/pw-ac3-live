@@ -683,8 +683,8 @@ pub fn run_pipewire_loop_with_config(
                                 let available = consumer.slots();
 
 
-                                if !playback_primed.load(Ordering::Relaxed) {
-                                    if available >= prefill_target {
+                                if !playback_primed.load(Ordering::Relaxed)
+                                    && available >= prefill_target {
                                         playback_primed.store(true, Ordering::Relaxed);
                                         if !playback_prefill_logged.swap(true, Ordering::Relaxed)
                                         {
@@ -694,7 +694,6 @@ pub fn run_pipewire_loop_with_config(
                                             );
                                         }
                                     }
-                                }
 
                                 if playback_primed.load(Ordering::Relaxed) {
                                     let readable = available
