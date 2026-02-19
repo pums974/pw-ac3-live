@@ -69,10 +69,11 @@ The output path for platforms where PipeWire's ALSA sink plugin introduces unacc
 *   **Graph Node**: No output node is created in the PipeWire graph.
 *   **Exclusive Access Process**:
     1.  **Device Identification**: The script targets `hw:0,8` (Valve Dock HDMI).
-    2.  **Profile Disabling**: The script explicitly disables the card profile (`pactl set-card-profile ... off`) to release the ALSA device and unlock IEC958 controls.
-    3.  **IEC958 Configuration**: The script uses `iecset` to force status bits to "Non-Audio" (compressed), bruteforcing all indices to ensure the setting takes effect.
-    4.  **Playback**: `aplay` takes exclusive control of the device.
-    5.  **Cleanup**: On exit, the script restores IEC958 status to "Audio" (PCM) and **restores the original Card Profile** to hand control back to PipeWire.
+    2.  **Internal Speaker Isolation**: The script captures and disables the internal speaker card profile (`alsa_card.pci-0000_04_00.5-platform-nau8821-max -> off`) to prevent fallback playback leaks during transitions.
+    3.  **HDMI Profile Disabling**: The script disables the HDMI card profile (`alsa_card.pci-0000_04_00.1 -> off`) to release the ALSA device and unlock IEC958 controls.
+    4.  **IEC958 Configuration**: The script uses `iecset -c 0 -n 2 audio off rate 48000` to force status bits to "Non-Audio" (compressed).
+    5.  **Playback**: `aplay` takes exclusive control of `hw:0,8`.
+    6.  **Cleanup**: On exit, the script stops the pipeline, restores IEC958 status to "Audio" (PCM), restores HDMI card/default sink, and restores the original internal speaker profile.
 *   **Volume**: The script unmutes hardware controls (`amixer`) but relies on `aplay` passing raw data. Software volume is effectively bypassed.
 
 ## Launcher Architecture
@@ -83,10 +84,10 @@ The project splits launch logic into two distinct scripts, each implementing the
 *   **Target Hardware**: Valve Steam Deck Docking Station.
 *   **Output Path**: **Direct ALSA** (`aplay` to `hw:0,8`).
 *   **Behavior**:
-    *   Hardcoded detection of known Loopback/HDMI sinks.
+    *   Hardcoded Steam Deck card IDs and loopback sink names (no runtime hardware discovery).
     *   Uses direct `aplay` passthrough to the hardware to avoid PipeWire scheduling jitter/stuttering on the Deck.
-    *   Manages IEC958 Non-Audio bit configuration and profile disabling for exclusive hardware access.
-    *   Aggressive cleanup/recovery logic (killing children, resetting PulseAudio profiles).
+    *   Manages IEC958 Non-Audio bit configuration plus internal-speaker profile disable/restore for leak prevention.
+    *   Restores HDMI profile/default sink and internal speaker profile during cleanup.
 
 ### 2. `scripts/launch_live_laptop.sh`
 *   **Target Hardware**: Generic Linux desktop/laptop.

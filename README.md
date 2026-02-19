@@ -83,17 +83,19 @@ With the launcher scripts (choose the one for your platform):
 ./scripts/launch_live_laptop.sh
 ```
 
+> **Critical warning (Steam Deck / Direct ALSA):**
+> While `launch_live_steamdeck.sh` is running, **do not suspend/sleep** the system and **do not disconnect HDMI**.
+> Doing so can leave PipeWire/ALSA card profiles in an inconsistent state (no audio, wrong sink, or noisy output) until manual recovery or reboot.
+> Always stop the script cleanly with `Ctrl+C` before suspend, dock/undock, or HDMI cable changes.
+
 ### Script Configuration
 
-Both scripts support environment variable overrides, but defaults differ.
+The two launcher scripts expose different knobs.
 
-**Common Options:**
+**Laptop (`launch_live_laptop.sh`) options:**
 ```bash
 # Optional: lower output ring independently (frames)
 PW_AC3_OUTPUT_BUFFER_SIZE=960 ./scripts/launch_live_laptop.sh
-
-# Optional: force a specific physical HDMI sink node
-PW_AC3_TARGET_SINK=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 ./scripts/launch_live_steamdeck.sh
 
 # Optional (loopback-only setups): force app target and link target separately
 PW_AC3_APP_TARGET=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 \
@@ -101,11 +103,28 @@ PW_AC3_CONNECT_TARGET=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 \
 ./scripts/launch_live_laptop.sh
 ```
 
+**Steam Deck (`launch_live_steamdeck.sh`) options:**
+```bash
+# Optional: tune node/ffmpeg pacing
+PW_AC3_NODE_LATENCY=1536/48000 \
+PW_AC3_FFMPEG_THREAD_QUEUE_SIZE=4 \
+PW_AC3_FFMPEG_CHUNK_FRAMES=1536 \
+./scripts/launch_live_steamdeck.sh
+
+# Optional: tune direct ALSA buffering
+PW_AC3_DIRECT_ALSA_BUFFER_TIME=60000 \
+PW_AC3_DIRECT_ALSA_PERIOD_TIME=15000 \
+./scripts/launch_live_steamdeck.sh
+```
+
 **Steam Deck Specifics (`launch_live_steamdeck.sh`):**
 - **Output Path**: **Direct ALSA** (`aplay` to `hw:0,8`).
 - **Why?**: PipeWire's ALSA sink introduces choppy audio/stuttering on the Deck.
-- **Hardcoded defaults**: Aligns with Valve Dock hardware on Steam Deck.
-- **Behavior**: Takes exclusive control of the HDMI audio device, disables the card profile, configures IEC958 Non-Audio bits, and restores state on exit.
+- **Hardcoded card/sink IDs**: Aligns with Valve Dock + Steam Deck internals:
+  - HDMI card: `alsa_card.pci-0000_04_00.1`
+  - Internal speaker card: `alsa_card.pci-0000_04_00.5-platform-nau8821-max`
+  - Loopback sink: `alsa_loopback_device.alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2`
+- **Behavior**: Disables the internal speaker card profile while running, disables HDMI card profile to release `hw:0,8`, configures IEC958 Non-Audio, then restores IEC958/card profiles/default sink on exit.
 
 **Laptop/Generic Specifics (`launch_live_laptop.sh`):**
 - **Output Path**: **PipeWire Native** (in-graph playback stream).

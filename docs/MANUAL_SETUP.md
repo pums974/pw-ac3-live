@@ -12,11 +12,18 @@ pkill -INT -f aplay || true
 ```
 
 ### 2. Verify Tools
-You will need the following tools installed and in your PATH:
+Use the built-in environment validator. It checks required tools and prints the card/sink/hardware data you need for the next steps.
+
 ```bash
-command -v cargo ffmpeg wpctl pw-link pactl iecset aplay
+./scripts/validate_env.sh
 ```
-*Note: `iecset` and `aplay` are part of `alsa-utils`.*
+
+What to copy from the report:
+- **PipeWire Cards & Profiles**: card names + active profiles.
+- **PipeWire Objects Tables**: sink node names and card/profile mappings.
+- **ALSA Hardware**: `hw:X,Y` endpoints (look for HDMI entries).
+
+If it reports failures, fix them first.
 
 ### 3. Build the Project
 ```bash
@@ -45,8 +52,9 @@ Standard setup for most Linux desktops.
 **Do not** use Surround 5.1/7.1 profiles; they will interpret the data as noise on Front Left/Right.
 
 ```bash
-# Find your card name
-pactl list cards short
+# From validate_env output:
+#   - pick your HDMI card name from "PipeWire Cards & Profiles"
+#   - use an HDMI stereo profile listed for that card
 
 # Set to HDMI Stereo + Analog Input (standard profile)
 pactl set-card-profile alsa_card.pci-0000_00_1f.3 output:hdmi-stereo+input:analog-stereo
@@ -56,8 +64,8 @@ pactl set-card-profile alsa_card.pci-0000_00_1f.3 output:hdmi-stereo+input:analo
 You must force the sink to accept AC-3 passthrough (IEC61937) and set volume to 100%.
 
 ```bash
-# Find sink index
-pactl list sinks short | grep hdmi-stereo
+# From validate_env output:
+#   - pick HDMI sink index from "PipeWire Objects Tables" (sink node names table)
 
 # Force format (replace <SINK_INDEX> with the number from above)
 pactl set-sink-formats <SINK_INDEX> 'ac3-iec61937, format.rate = "[ 48000 ]"'
@@ -71,8 +79,8 @@ pactl set-sink-mute <SINK_INDEX> 0
 ### 3. Run the Encoder
 Target the HDMI sink by name.
 ```bash
-# Get sink name
-pactl list sinks short | grep hdmi-stereo
+# From validate_env output:
+#   - pick sink node name from "PipeWire Objects Tables"
 
 # Run
 RUST_LOG=info cargo run --release -- \
@@ -87,44 +95,46 @@ RUST_LOG=info cargo run --release -- \
 
 This path gives the encoder exclusive access to the HDMI hardware, bypassing PipeWire's mixing/scheduling for the output stage.
 
-### 1. Find the Hardware Device
-You need the ALSA hardware card and device numbers (e.g., `hw:0,3`).
+### 2. Release HDMI Card and Set IEC958 Non-Audio
+Disable HDMI profile first, then set IEC958 to Non-Audio (index `2`).
 
 ```bash
-aplay -l | grep HDMI
-# Output example: card 0: PCH [HDA Intel PCH], device 3: HDMI 0 [HDMI 0]
-```
- In this example, the device is `hw:0,3`.
+HDMI_CARD=alsa_card.pci-0000_04_00.1
 
-### 2. Set "Non-Audio" Bit (The "Zombie State" Fix)
-For AC-3 passthrough to work reliably on some hardware (like Steam Deck), you must set the IEC958 status bits to "Non-Audio". If this is set to "Audio" (PCM), the receiver might try to decode the burst as PCM noise.
-
-You often need to try multiple indices (0-3) as mapping varies.
-```bash
-# Replace '-c 0' with your card index found in step 1.
-# Run for indices 0, 1, 2, 3 to be safe.
-iecset -c 0 -n 0 audio off rate 48000
-iecset -c 0 -n 1 audio off rate 48000
+pactl set-card-profile "$HDMI_CARD" off
 iecset -c 0 -n 2 audio off rate 48000
-iecset -c 0 -n 3 audio off rate 48000
 ```
 
 ### 3. Run the Pipeline
-We pipe the encoder's stdout directly to `aplay`.
+Pipe encoder `--stdout` to `aplay` with the same defaults as the Steam Deck launcher.
 
 ```bash
-# --stdout mode writes raw IEC61937 frames to standard output
-RUST_LOG=info cargo run --release -- --stdout \
-  --buffer-size 6144 \
-  --output-buffer-size 3072 \
-  --ffmpeg-thread-queue-size 32 \
-| aplay -D hw:0,3 \
-  --disable-resample --disable-format --disable-channels --disable-softvol \
-  -v -t raw -f S16_LE -r 48000 -c 2 \
+APP_BIN=./target/release/pw-ac3-live
+[ -x "$APP_BIN" ] || APP_BIN=./bin/pw-ac3-live
+
+"$APP_BIN" --stdout \
+  --latency 1536/48000 \
+  --ffmpeg-thread-queue-size 4 \
+  --ffmpeg-chunk-frames 1536 \
+| aplay -D hw:0,8 \
+  -t raw -f S16_LE -r 48000 -c 2 \
   --buffer-time=60000 --period-time=15000
 ```
 
-*Note: The buffer sizes above are tuned for the Steam Deck. If you experience stutters, try increasing `buffer-time`.*
+### 4. Cleanup / Restore
+Restore IEC958 and card profiles when you stop.
+
+```bash
+iecset -c 0 -n 2 audio on
+pactl set-card-profile "$HDMI_CARD" output:hdmi-stereo-extra2
+pactl set-default-sink alsa_loopback_device.alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2
+
+if [ -n "$INTERNAL_PROFILE" ]; then
+  pactl set-card-profile "$INTERNAL_CARD" "$INTERNAL_PROFILE"
+fi
+```
+
+*Tip: `scripts/launch_live_steamdeck.sh` automates this full sequence and is preferred over manual invocation.*
 
 ---
 
@@ -172,13 +182,14 @@ If you experience latency or dropouts, adjust these flags:
 | `--output-buffer-size` | =buffer-size | Output ring buffer size. Increase this first if you hear dropouts. |
 | `--latency` | 64/48000 | PipeWire quantum target. Lower is better for latency but requires stable CPU. |
 | `--ffmpeg-thread-queue-size` | 128 | FFmpeg input packet queue. |
+| `--ffmpeg-chunk-frames` | 128 | Frame batch size written to FFmpeg. Higher values improve stability, lower values reduce burst latency. |
 
 **Low Latency Profile (Laptop):**
 ```bash
 --buffer-size 960 --latency 32/48000 --ffmpeg-thread-queue-size 16
 ```
 
-**Stable Profile (Steam Deck):**
+**Launcher Default (Steam Deck script):**
 ```bash
---buffer-size 3072 --output-buffer-size 6144 --ffmpeg-thread-queue-size 32
+--latency 1536/48000 --ffmpeg-thread-queue-size 4 --ffmpeg-chunk-frames 1536
 ```
