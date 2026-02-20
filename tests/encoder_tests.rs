@@ -6,9 +6,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+const IEC61937_AC3_BURST_BYTES: usize = 6144;
+
 fn wait_for_output<T>(consumer: &Consumer<T>, timeout: Duration) {
+    wait_for_output_at_least(consumer, 1, timeout);
+}
+
+fn wait_for_output_at_least<T>(consumer: &Consumer<T>, min_slots: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
-    while consumer.slots() == 0 && Instant::now() < deadline {
+    while consumer.slots() < min_slots && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -556,7 +562,11 @@ fn test_encoder_multiple_iec61937_frames() {
         }
     }
 
-    wait_for_output(&output_consumer, Duration::from_secs(5));
+    wait_for_output_at_least(
+        &output_consumer,
+        10 * IEC61937_AC3_BURST_BYTES,
+        Duration::from_secs(10),
+    );
     running.store(false, Ordering::SeqCst);
     let _ = encoder_handle.join().unwrap();
 
@@ -620,7 +630,11 @@ fn test_encoder_iec61937_frame_spacing() {
         }
     }
 
-    wait_for_output(&output_consumer, Duration::from_secs(5));
+    wait_for_output_at_least(
+        &output_consumer,
+        3 * IEC61937_AC3_BURST_BYTES,
+        Duration::from_secs(10),
+    );
     running.store(false, Ordering::SeqCst);
     let _ = encoder_handle.join().unwrap();
 
@@ -654,9 +668,9 @@ fn test_encoder_iec61937_frame_spacing() {
     for window in positions.windows(2) {
         let spacing = window[1] - window[0];
         assert_eq!(
-            spacing, 6144,
-            "IEC 61937 frame spacing should be 6144 bytes, got {} (at positions {} and {})",
-            spacing, window[0], window[1]
+            spacing, IEC61937_AC3_BURST_BYTES,
+            "IEC 61937 frame spacing should be {} bytes, got {} (at positions {} and {})",
+            IEC61937_AC3_BURST_BYTES, spacing, window[0], window[1]
         );
     }
 }
