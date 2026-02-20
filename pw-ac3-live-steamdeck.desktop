@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=pw-ac3-live (Steam Deck)
+GenericName=AC-3 Live Encoder
+Comment=Run pw-ac3-live using the direct ALSA Steam Deck output path
+Exec=sh -c "cd \"\\$(dirname \"%k\")\" && exec ./scripts/launch_steamdeck.sh"
+Terminal=true
+Icon=audio-card
+Categories=AudioVideo;Audio;
+Keywords=ac3;pipewire;audio;spdif;hdmi;steamdeck;
+StartupNotify=false
