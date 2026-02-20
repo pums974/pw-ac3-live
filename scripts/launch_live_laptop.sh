@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+COMMON_LIB="${ROOT_DIR}/scripts/lib/launch_common.sh"
 
 LOW_LATENCY_NODE_LATENCY="${PW_AC3_NODE_LATENCY:-64/48000}"
 LOW_LATENCY_THREAD_QUEUE="${PW_AC3_FFMPEG_THREAD_QUEUE_SIZE:-16}"
@@ -12,63 +13,22 @@ CONNECT_TARGET_OVERRIDE="${PW_AC3_CONNECT_TARGET:-}"
 APP_BIN_OVERRIDE="${PW_AC3_APP_BIN:-}"
 
 APP_PID=""
+# shellcheck disable=SC2034 # Mutated indirectly via begin_cleanup_once.
 CLEANUP_DONE=0
 ORIGINAL_DEFAULT_SINK=""
 ORIGINAL_CARD_PROFILE=""
 SELECTED_CARD_NAME=""
 APP_ISOLATED_SESSION=0
 APP_BIN=""
+APP_TARGET=""
+CONNECT_TARGET=""
 
-warn() {
-  echo "Warning: $1"
-}
-
-require_command() {
-  local cmd="$1"
-  if ! command -v "$cmd" > /dev/null 2>&1; then
-    echo "Error: '$cmd' not found."
-    exit 1
-  fi
-}
-
-resolve_app_bin() {
-  if [ -n "$APP_BIN_OVERRIDE" ] && [ -x "$APP_BIN_OVERRIDE" ]; then
-    APP_BIN="$APP_BIN_OVERRIDE"
-    return 0
-  fi
-
-  if [ -x "${ROOT_DIR}/bin/pw-ac3-live" ]; then
-    APP_BIN="${ROOT_DIR}/bin/pw-ac3-live"
-    return 0
-  fi
-
-  if [ -x "${ROOT_DIR}/target/release/pw-ac3-live" ]; then
-    APP_BIN="${ROOT_DIR}/target/release/pw-ac3-live"
-    return 0
-  fi
-
-  echo "Error: pw-ac3-live binary not found."
-  echo "Tried:"
-  [ -n "$APP_BIN_OVERRIDE" ] && echo "  PW_AC3_APP_BIN=$APP_BIN_OVERRIDE"
-  echo "  ${ROOT_DIR}/bin/pw-ac3-live"
-  echo "  ${ROOT_DIR}/target/release/pw-ac3-live"
-  echo "Build it first with: cargo build --release"
+if [ ! -r "$COMMON_LIB" ]; then
+  echo "Error: shared launcher library not found: $COMMON_LIB"
   exit 1
-}
-
-get_card_active_profile() {
-  local card_name="$1"
-  pactl list cards | awk -v card="$card_name" '
-        $1 == "Name:" { in_card = ($2 == card) }
-        in_card && $1 == "Active" && $2 == "Profile:" {
-            $1 = ""
-            $2 = ""
-            sub(/^[[:space:]]+/, "", $0)
-            print $0
-            exit
-        }
-    '
-}
+fi
+# shellcheck source=/dev/null
+source "$COMMON_LIB"
 
 sink_exists() {
   local sink_name="$1"
@@ -113,57 +73,29 @@ terminate_pipeline() {
     return 0
   fi
 
-  local -a terminate_cmd=(kill "$APP_PID")
-  local -a probe_cmd=(kill -0 "$APP_PID")
-  local -a force_cmd=(kill -9 "$APP_PID")
-  if [ "$APP_ISOLATED_SESSION" = "1" ]; then
-    terminate_cmd=(kill -TERM -- "-$APP_PID")
-    probe_cmd=(kill -0 -- "-$APP_PID")
-    force_cmd=(kill -KILL -- "-$APP_PID")
-  fi
-
-  if ! "${probe_cmd[@]}" > /dev/null 2>&1; then
-    APP_PID=""
-    return 0
-  fi
-
   echo "Stopping pw-ac3-live pipeline..."
-  "${terminate_cmd[@]}" > /dev/null 2>&1 || true
-
-  for _ in $(seq 1 6); do
-    if ! "${probe_cmd[@]}" > /dev/null 2>&1; then
-      APP_PID=""
-      return 0
-    fi
-    sleep 0.05
-  done
-
-  warn "Graceful shutdown timed out; forcing process stop."
-  "${force_cmd[@]}" > /dev/null 2>&1 || true
+  local use_process_group=0
+  if [ "$APP_ISOLATED_SESSION" = "1" ]; then
+    use_process_group=1
+  fi
+  if ! terminate_pid_with_retries "$APP_PID" 6 0.05 "$use_process_group"; then
+    warn "Graceful shutdown timed out; forcing process stop."
+  fi
   APP_PID=""
 }
 
 cleanup() {
   local message="${1:-Cleaning up...}"
 
-  if [ "$CLEANUP_DONE" = "1" ]; then
+  if ! begin_cleanup_once CLEANUP_DONE; then
     return 0
   fi
-  CLEANUP_DONE=1
 
   echo "$message"
   restore_default_sink_and_streams
   restore_card_profile
   terminate_pipeline
   echo "Cleanup finished"
-}
-
-find_pw_ac3_live_sink_input_id() {
-  pactl list sink-inputs | awk '
-        /^Sink Input #/ { id = substr($3, 2); next }
-        /^[[:space:]]*application.name = "pw-ac3-live"/ { print id; exit }
-        /^[[:space:]]*Application Name: pw-ac3-live$/ { print id; exit }
-    '
 }
 
 detect_hdmi_card() {
@@ -215,53 +147,7 @@ configure_hdmi_passthrough() {
     pactl set-sink-formats "$sink_index" "ac3-iec61937" || warn "Failed to set AC3 sink formats."
   fi
 
-  pactl set-sink-volume "$sink_index" 100%
-  pactl set-sink-mute "$sink_index" 0
-}
-
-normalize_pw_ac3_live_levels() {
-  echo "Normalizing pw-ac3-live node/stream volumes..."
-  pactl set-sink-volume "pw-ac3-live-input" 100% || true
-  pactl set-sink-mute "pw-ac3-live-input" 0 || true
-
-  local stream_id=""
-  for ((i = 0; i < 20; i++)); do
-    stream_id="$(find_pw_ac3_live_sink_input_id)"
-    if [ -n "$stream_id" ]; then
-      pactl set-sink-input-volume "$stream_id" 100% || true
-      pactl set-sink-input-mute "$stream_id" 0 || true
-      echo "Set pw-ac3-live playback stream volume to 100% (sink-input #$stream_id)."
-      return 0
-    fi
-    sleep 0.5
-  done
-
-  warn "Could not find pw-ac3-live playback sink-input; leaving stream volume unchanged."
-}
-
-wait_for_encoder_input_node() {
-  for ((i = 0; i < 20; i++)); do
-    if pw-link -i | grep -q "pw-ac3-live-input"; then
-      return 0
-    fi
-    sleep 0.5
-  done
-  return 1
-}
-
-set_default_encoder_sink() {
-  for ((i = 0; i < 20; i++)); do
-    if pactl set-default-sink "pw-ac3-live-input" > /dev/null 2>&1; then
-      return 0
-    fi
-    sleep 0.25
-  done
-  return 1
-}
-
-move_existing_streams_to_encoder_input() {
-  echo "Moving existing streams to AC-3 Encoder Input..."
-  pactl list sink-inputs short | cut -f1 | xargs -r -P 8 -I{} pactl move-sink-input {} "pw-ac3-live-input" > /dev/null 2>&1 || true
+  set_sink_full_volume_unmuted "$sink_index"
 }
 
 link_encoder_output_to_target() {
@@ -343,14 +229,26 @@ link_encoder_output_to_target() {
 }
 
 main() {
+  preflight_checks
+  stop_stale_runtime
+  prepare_pipewire_output
+  launch_pipeline
+  configure_post_launch_routing
+  monitor_pipeline
+}
+
+preflight_checks() {
   require_command pactl
   require_command pw-link
-  resolve_app_bin
+  resolve_pw_ac3_live_bin_or_die "$ROOT_DIR" "$APP_BIN_OVERRIDE" APP_BIN
+}
 
+stop_stale_runtime() {
   echo "Stopping any existing instances..."
-  pkill -INT -f "pw-ac3-live" || true
-  sleep 1
+  stop_existing_pw_ac3_live 1
+}
 
+prepare_pipewire_output() {
   echo "Detecting HDMI card..."
   local card_name
   card_name="$(detect_hdmi_card)"
@@ -402,12 +300,16 @@ main() {
   local app_target connect_target
   app_target="${APP_TARGET_OVERRIDE:-$sink_name}"
   connect_target="${CONNECT_TARGET_OVERRIDE:-$sink_name}"
+  APP_TARGET="$app_target"
+  CONNECT_TARGET="$connect_target"
   echo "App binary: $APP_BIN"
-  echo "App target: $app_target"
-  echo "Link target: $connect_target"
+  echo "App target: $APP_TARGET"
+  echo "Link target: $CONNECT_TARGET"
+}
 
+launch_pipeline() {
   local -a app_args=(
-    --target "$app_target"
+    --target "$APP_TARGET"
     --latency "$LOW_LATENCY_NODE_LATENCY"
     --ffmpeg-thread-queue-size "$LOW_LATENCY_THREAD_QUEUE"
     --ffmpeg-chunk-frames "$LOW_LATENCY_CHUNK_FRAMES"
@@ -424,24 +326,24 @@ main() {
     APP_ISOLATED_SESSION=0
   fi
   echo "App launched with PID $APP_PID"
+}
 
+configure_post_launch_routing() {
   echo "Waiting for pw-ac3-live-input node..."
-  if ! wait_for_encoder_input_node; then
+  if ! wait_for_node_input_ports "pw-ac3-live-input" 20 0.5; then
     warn "pw-ac3-live-input input ports not found yet. App might still be starting."
   fi
 
   echo "Setting default sink to AC-3 Encoder Input..."
-  if ! set_default_encoder_sink; then
+  if ! configure_encoder_input_routing "pw-ac3-live-input" 20 0.25 20 0.5; then
     warn "Could not set default sink via pactl."
   fi
 
-  move_existing_streams_to_encoder_input
-
   echo "Ensuring encoder output is linked to target sink..."
-  link_encoder_output_to_target "$connect_target"
+  link_encoder_output_to_target "$CONNECT_TARGET"
+}
 
-  normalize_pw_ac3_live_levels
-
+monitor_pipeline() {
   echo "========================================"
   echo "LAUNCH SUCCESSFUL"
   echo "pw-ac3-live is running. Keep receiver volume controlled (bitstream path)."

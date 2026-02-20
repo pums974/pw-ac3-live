@@ -48,6 +48,7 @@ The application supports two distinct output paths. You must understand the diff
 - `scripts/`: Critical runtime scripts.
     - `launch_live_steamdeck.sh`: **Primary production script** for the target hardware.
     - `launch_live_laptop.sh`: Dev/Laptop testing script with integrated PipeWire link management.
+    - `lib/launch_common.sh`: Shared shell helpers used by both launch scripts.
 
 ## Constraints & Behaviors
 - **Real-time Safety**: NEVER allocate memory, lock blocking mutexes, or perform I/O in the `process()` callback. Use `rtrb` for lock-free communication.

@@ -1,78 +1,45 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 # Goal: setup HDMI for AC-3 passthrough and launch the encoder on Steam Deck.
 # This script is hardcoded for known Steam Deck + Dock hardware.
 
-# ------------------------------------------------------------------
-# CONFIGURATION
-# ------------------------------------------------------------------
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+COMMON_LIB="${ROOT_DIR}/scripts/lib/launch_common.sh"
 
-# Application binary
-APP_BIN="${ROOT_DIR}/bin/pw-ac3-live"
+APP_BIN_OVERRIDE="${PW_AC3_APP_BIN:-}"
 
-# Latency tuning
 LOW_LATENCY_NODE_LATENCY="${PW_AC3_NODE_LATENCY:-1536/48000}"
 LOW_LATENCY_THREAD_QUEUE="${PW_AC3_FFMPEG_THREAD_QUEUE_SIZE:-4}"
 LOW_LATENCY_CHUNK_FRAMES="${PW_AC3_FFMPEG_CHUNK_FRAMES:-1536}"
 
-# Steam Deck hardware identifiers
 DIRECT_ALSA_DEVICE="hw:0,8"
 HDMI_CARD_NAME="alsa_card.pci-0000_04_00.1"
 INTERNAL_SPEAKER_CARD_NAME="alsa_card.pci-0000_04_00.5-platform-nau8821-max"
 LOOPBACK_SINK_NAME="alsa_loopback_device.alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2"
 
-# ALSA IEC958 controls
 ALSA_CARD_INDEX=0
 IEC958_INDEX=2
 
-# Direct ALSA output parameters
 DIRECT_ALSA_BUFFER_TIME="${PW_AC3_DIRECT_ALSA_BUFFER_TIME:-60000}"
 DIRECT_ALSA_PERIOD_TIME="${PW_AC3_DIRECT_ALSA_PERIOD_TIME:-15000}"
 
-# Runtime state
-CLEANUP_DONE=0
+APP_BIN=""
 APP_PID=""
 POST_LAUNCH_CONFIG_PID=""
 INTERNAL_SPEAKER_PROFILE=""
+APP_ISOLATED_SESSION=0
+# shellcheck disable=SC2034 # Mutated indirectly via begin_cleanup_once.
+CLEANUP_DONE=0
 
-# ------------------------------------------------------------------
-# UTILITY FUNCTIONS
-# ------------------------------------------------------------------
+if [ ! -r "$COMMON_LIB" ]; then
+  echo "Error: shared launcher library not found: $COMMON_LIB"
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$COMMON_LIB"
 
-warn() {
-  echo "Warning: $1"
-}
-
-require_command() {
-  local cmd="$1"
-  if ! command -v "$cmd" > /dev/null 2>&1; then
-    echo "Error: '$cmd' not found. Cannot proceed."
-    exit 1
-  fi
-}
-
-get_card_active_profile() {
-  local card_name="$1"
-  pactl list cards | awk -v card="$card_name" '
-        $1 == "Name:" {
-            in_card = ($2 == card)
-        }
-        in_card && $1 == "Active" && $2 == "Profile:" {
-            $1 = ""
-            $2 = ""
-            sub(/^[[:space:]]+/, "", $0)
-            print $0
-            exit
-        }
-    '
-}
-
-# Disable the internal speakers by setting their card profile to "off".
-# We capture the original profile once and restore it during cleanup.
 disable_internal_speaker_profile() {
   local active_profile=""
 
@@ -80,7 +47,7 @@ disable_internal_speaker_profile() {
     return 0
   fi
 
-  active_profile=$(get_card_active_profile "$INTERNAL_SPEAKER_CARD_NAME")
+  active_profile="$(get_card_active_profile "$INTERNAL_SPEAKER_CARD_NAME")"
   if [ -z "$active_profile" ]; then
     warn "Internal speaker card not found: $INTERNAL_SPEAKER_CARD_NAME"
     return 0
@@ -111,23 +78,30 @@ restore_internal_speaker_profile() {
   fi
 }
 
+terminate_post_launch_config_task() {
+  if [ -z "$POST_LAUNCH_CONFIG_PID" ]; then
+    return 0
+  fi
+
+  terminate_pid_with_retries "$POST_LAUNCH_CONFIG_PID" 3 0.03 0 || true
+  pkill -P "$POST_LAUNCH_CONFIG_PID" > /dev/null 2>&1 || true
+  POST_LAUNCH_CONFIG_PID=""
+}
+
 terminate_pipeline() {
   if [ -z "$APP_PID" ]; then
     return 0
   fi
 
-  echo "Killing app..."
-  kill "$APP_PID" > /dev/null 2>&1 || return 0
-
-  local retries=3
-  for _ in $(seq 1 "$retries"); do
-    if ! kill -0 "$APP_PID" > /dev/null 2>&1; then
-      return 0
-    fi
-    sleep 0.03
-  done
-
-  kill -9 "$APP_PID" > /dev/null 2>&1 || true
+  echo "Stopping pw-ac3-live pipeline..."
+  local use_process_group=0
+  if [ "$APP_ISOLATED_SESSION" = "1" ]; then
+    use_process_group=1
+  fi
+  if ! terminate_pid_with_retries "$APP_PID" 6 0.05 "$use_process_group"; then
+    warn "Graceful shutdown timed out; forcing process stop."
+  fi
+  APP_PID=""
 }
 
 restore_hdmi_audio_state() {
@@ -147,75 +121,37 @@ restore_hdmi_audio_state() {
 }
 
 configure_post_launch_routing() {
-  echo "Configuring default sink..."
-  local set_default_ok=0
-  for _ in $(seq 1 8); do
-    if pactl set-default-sink "pw-ac3-live-input" > /dev/null 2>&1; then
-      set_default_ok=1
-      break
-    fi
-    sleep 0.05
-  done
-  if [ "$set_default_ok" = "0" ]; then
+  echo "Waiting for pw-ac3-live-input node..."
+  if ! wait_for_node_input_ports "pw-ac3-live-input" 20 0.1; then
+    warn "pw-ac3-live-input input ports not found yet. App might still be starting."
+  fi
+
+  echo "Configuring AC-3 Encoder Input routing..."
+  if ! configure_encoder_input_routing "pw-ac3-live-input" 8 0.05 12 0.1; then
     warn "Could not set default sink to pw-ac3-live-input."
   fi
-
-  echo "Moving existing streams..."
-  pactl list sink-inputs short | cut -f1 | xargs -r -P 8 -I{} pactl move-sink-input {} "pw-ac3-live-input" > /dev/null 2>&1 || true
-
-  echo "Normalizing pw-ac3-live node/stream volumes..."
-  pactl set-sink-volume "pw-ac3-live-input" 100% || true
-  pactl set-sink-mute "pw-ac3-live-input" 0 || true
 }
 
-cleanup() {
-  local message="${1:-Cleaning up...}"
-
-  if [ "$CLEANUP_DONE" = "1" ]; then
-    return 0
-  fi
-  CLEANUP_DONE=1
-
-  echo "Starting cleanup: $message"
-  disable_internal_speaker_profile
-
-  if [ -n "$POST_LAUNCH_CONFIG_PID" ]; then
-    kill "$POST_LAUNCH_CONFIG_PID" > /dev/null 2>&1 || true
-    pkill -P "$POST_LAUNCH_CONFIG_PID" > /dev/null 2>&1 || true
-  fi
-
-  terminate_pipeline
-
-  local iec_restore_pid=""
-  if command -v iecset > /dev/null 2>&1; then
-    (iecset -c "$ALSA_CARD_INDEX" -n "$IEC958_INDEX" audio on > /dev/null 2>&1 || true) &
-    iec_restore_pid=$!
-  fi
-
-  restore_hdmi_audio_state
-  restore_internal_speaker_profile
-
-  if [ -n "$iec_restore_pid" ]; then
-    wait "$iec_restore_pid" 2> /dev/null || true
-  fi
-
-  echo "Cleanup finished"
-}
-
-# ------------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------------
-
-main() {
-  pactl list short modules | awk '/sink_name=pw_ac3_direct_hdmi/ { print $1 }' | xargs -r -I{} pactl unload-module {} > /dev/null 2>&1 || true
-
+preflight_checks() {
   require_command aplay
   require_command pactl
   require_command amixer
+  require_command pw-link
+  resolve_pw_ac3_live_bin_or_die "$ROOT_DIR" "$APP_BIN_OVERRIDE" APP_BIN
+
   if ! command -v iecset > /dev/null 2>&1; then
     warn "'iecset' not found. IEC958 status may not be forced."
   fi
+}
 
+stop_stale_runtime() {
+  echo "Stopping any existing instances..."
+  stop_existing_pw_ac3_live 1
+
+  pactl list short modules | awk '/sink_name=pw_ac3_direct_hdmi/ { print $1 }' | xargs -r -I{} pactl unload-module {} > /dev/null 2>&1 || true
+}
+
+prepare_direct_alsa_output() {
   disable_internal_speaker_profile
 
   echo "Disabling HDMI card profile '$HDMI_CARD_NAME' to release ALSA device..."
@@ -236,47 +172,87 @@ main() {
   wait "$amixer_master_pid" 2> /dev/null || true
   wait "$amixer_pcm_pid" 2> /dev/null || true
   wait "$amixer_iec_pid" 2> /dev/null || true
+}
 
-  echo "Launching pipeline to $DIRECT_ALSA_DEVICE..."
+launch_pipeline() {
+  local -a app_args=(
+    --stdout
+    --latency "$LOW_LATENCY_NODE_LATENCY"
+    --ffmpeg-thread-queue-size "$LOW_LATENCY_THREAD_QUEUE"
+    --ffmpeg-chunk-frames "$LOW_LATENCY_CHUNK_FRAMES"
+  )
+
+  echo "App binary: $APP_BIN"
+  echo "Direct ALSA device: $DIRECT_ALSA_DEVICE"
+  echo "Launching pw-ac3-live..."
   (
-    "${APP_BIN}" --stdout \
-      --latency "$LOW_LATENCY_NODE_LATENCY" \
-      --ffmpeg-thread-queue-size "$LOW_LATENCY_THREAD_QUEUE" \
-      --ffmpeg-chunk-frames "$LOW_LATENCY_CHUNK_FRAMES" \
-      2> /dev/null \
+    "${APP_BIN}" "${app_args[@]}" 2> /dev/null \
       | aplay -D "$DIRECT_ALSA_DEVICE" \
         -t raw -f S16_LE -r 48000 -c 2 --buffer-time="$DIRECT_ALSA_BUFFER_TIME" --period-time="$DIRECT_ALSA_PERIOD_TIME" \
         > /dev/null 2>&1
   ) &
   APP_PID=$!
-  echo "Pipeline launched with PID $APP_PID"
+  APP_ISOLATED_SESSION=0
+  echo "App launched with PID $APP_PID"
+}
 
+start_post_launch_routing_task() {
   configure_post_launch_routing &
   POST_LAUNCH_CONFIG_PID=$!
+}
 
-  echo "Launch successful - monitoring..."
+monitor_pipeline() {
+  echo "========================================"
+  echo "LAUNCH SUCCESSFUL"
   echo "pw-ac3-live is running on direct ALSA ($DIRECT_ALSA_DEVICE)."
   echo "Press Ctrl+C to stop."
   echo "========================================"
-  restore_internal_speaker_profile
 
-  local exit_code=0
+  local app_exit=0
   if ! wait "$APP_PID"; then
-    exit_code=$?
+    app_exit=$?
   fi
-
-  if [ "$exit_code" -ne 0 ]; then
-    echo "Error: Pipeline exited with code $exit_code"
-  fi
-
-  return "$exit_code"
+  APP_PID=""
+  return "$app_exit"
 }
 
-echo "Initial cleanup..."
-pkill -INT -f "pw-ac3-live" || true
+cleanup() {
+  local message="${1:-Cleaning up...}"
+
+  if ! begin_cleanup_once CLEANUP_DONE; then
+    return 0
+  fi
+
+  echo "$message"
+  terminate_post_launch_config_task
+  terminate_pipeline
+
+  local iec_restore_pid=""
+  if command -v iecset > /dev/null 2>&1; then
+    (iecset -c "$ALSA_CARD_INDEX" -n "$IEC958_INDEX" audio on > /dev/null 2>&1 || true) &
+    iec_restore_pid=$!
+  fi
+
+  restore_hdmi_audio_state
+  restore_internal_speaker_profile
+
+  if [ -n "$iec_restore_pid" ]; then
+    wait "$iec_restore_pid" 2> /dev/null || true
+  fi
+
+  echo "Cleanup finished"
+}
+
+main() {
+  preflight_checks
+  stop_stale_runtime
+  prepare_direct_alsa_output
+  launch_pipeline
+  start_post_launch_routing_task
+  monitor_pipeline
+}
 
 trap 'cleanup "Interrupted"; exit 130' INT TERM
 trap 'cleanup "Cleaning up..."' EXIT
 
 main
-exit $?
