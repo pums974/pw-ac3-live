@@ -1,10 +1,17 @@
 use pw_ac3_live::encoder;
-use rtrb::RingBuffer;
+use rtrb::{Consumer, RingBuffer};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+fn wait_for_output<T>(consumer: &Consumer<T>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while consumer.slots() == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
 
 #[test]
 fn test_encoder_throughput() {
@@ -39,8 +46,8 @@ fn test_encoder_throughput() {
         }
     }
 
-    // 4. Wait a bit for processing
-    thread::sleep(Duration::from_millis(500));
+    // 4. Wait until some encoded data is visible (CI can be slower than local).
+    wait_for_output(&output_consumer, Duration::from_secs(5));
 
     // 5. Signal stop
     running.store(false, Ordering::SeqCst);
@@ -162,8 +169,8 @@ fn test_encoder_multichannel_structure() {
         }
     }
 
-    // Wait for processing
-    thread::sleep(Duration::from_millis(500));
+    // Wait until we observe encoded output to avoid CI timing flakes.
+    wait_for_output(&output_consumer, Duration::from_secs(5));
 
     // Stop
     running.store(false, Ordering::SeqCst);
@@ -211,7 +218,7 @@ fn test_encoder_valid_iec61937() {
         }
     }
 
-    thread::sleep(Duration::from_millis(500));
+    wait_for_output(&output_consumer, Duration::from_secs(5));
     running.store(false, Ordering::SeqCst);
     let _ = encoder_handle.join().unwrap();
 
@@ -367,7 +374,9 @@ fn test_encoder_custom_config() {
         }
     }
 
-    thread::sleep(Duration::from_millis(500));
+    // With feeder_chunk_frames=1, encoding can be slow under CI contention.
+    // Poll for output instead of assuming a fixed processing delay.
+    wait_for_output(&output_consumer, Duration::from_secs(5));
     running.store(false, Ordering::SeqCst);
     let result = encoder_handle.join();
     assert!(result.is_ok(), "encoder thread panicked with custom config");
@@ -502,7 +511,7 @@ fn test_encoder_output_frame_aligned() {
         }
     }
 
-    thread::sleep(Duration::from_millis(500));
+    wait_for_output(&output_consumer, Duration::from_secs(5));
     running.store(false, Ordering::SeqCst);
     let _ = encoder_handle.join().unwrap();
 
@@ -547,7 +556,7 @@ fn test_encoder_multiple_iec61937_frames() {
         }
     }
 
-    thread::sleep(Duration::from_millis(1500));
+    wait_for_output(&output_consumer, Duration::from_secs(5));
     running.store(false, Ordering::SeqCst);
     let _ = encoder_handle.join().unwrap();
 
@@ -611,7 +620,7 @@ fn test_encoder_iec61937_frame_spacing() {
         }
     }
 
-    thread::sleep(Duration::from_millis(1500));
+    wait_for_output(&output_consumer, Duration::from_secs(5));
     running.store(false, Ordering::SeqCst);
     let _ = encoder_handle.join().unwrap();
 
