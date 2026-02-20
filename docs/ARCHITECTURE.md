@@ -54,7 +54,7 @@ The encoded IEC 61937 stream is delivered to the hardware via one of two possibl
 
 #### Path A: PipeWire Native
 The standard output path for desktop Linux setups where PipeWire's ALSA plugin performs well.
-*   **Used by**: `scripts/launch_live_laptop.sh`
+*   **Used by**: `scripts/launch_laptop.sh`
 *   **Context**: Playback Thread (RT-Safe), running in PipeWire `process` callback.
 *   **Priority**: Real-time (SCHED_FIFO).
 *   **Mechanism**: Writes audio data to a PipeWire output buffer.
@@ -64,7 +64,7 @@ The standard output path for desktop Linux setups where PipeWire's ALSA plugin p
 
 #### Path B: Direct ALSA
 The output path for platforms where PipeWire's ALSA sink plugin introduces unacceptable scheduling jitter for encoded bitstreams (e.g., the Steam Deck with Valve Dock).
-*   **Used by**: `scripts/launch_live_steamdeck.sh`
+*   **Used by**: `scripts/launch_steamdeck.sh`
 *   **Mechanism**: The application writes encoded data to `stdout`. The launcher script pipes this directly to `aplay` for exclusive hardware access.
 *   **Graph Node**: No output node is created in the PipeWire graph.
 *   **Exclusive Access Process**:
@@ -80,7 +80,7 @@ The output path for platforms where PipeWire's ALSA sink plugin introduces unacc
 
 The project splits launch logic into two distinct scripts, each implementing the output path best suited to its target platform:
 
-### 1. `scripts/launch_live_steamdeck.sh`
+### 1. `scripts/launch_steamdeck.sh`
 *   **Target Hardware**: Valve Steam Deck Docking Station.
 *   **Output Path**: **Direct ALSA** (`aplay` to `hw:0,8`).
 *   **Behavior**:
@@ -89,10 +89,10 @@ The project splits launch logic into two distinct scripts, each implementing the
     *   Manages IEC958 Non-Audio bit configuration plus internal-speaker profile disable/restore for leak prevention.
     *   Restores HDMI profile/default sink and internal speaker profile during cleanup.
 
-### 2. `scripts/launch_live_laptop.sh`
+### 2. `scripts/launch_laptop.sh`
 *   **Target Hardware**: Generic Linux desktop/laptop.
 *   **Output Path**: **PipeWire Native** (in-graph playback stream).
 *   **Behavior**:
-    *   Dynamic scanning for PCI sound cards and `hdmi-stereo` sinks.
-    *   Low-latency defaults (`64` frames) for responsive desktop usage.
-    *   Standard `pactl` profile switching logic.
+    *   Uses preconfigured PipeWire/ALSA identifiers (`CARD_NAME`, `TARGET_SINK`, `CONNECT_TARGET`, `TARGET_SINK_INDEX`) with no runtime hardware discovery.
+    *   Applies HDMI profile and AC-3 sink format, then launches `pw-ac3-live` with low-latency settings (`--latency 64/48000`, `--ffmpeg-thread-queue-size 16`, `--ffmpeg-chunk-frames 64`).
+    *   Sets `pw-ac3-live-input` as default sink, moves active sink inputs, links FL/FR outputs to the configured sink, and restores original sink/profile state during cleanup.

@@ -21,7 +21,7 @@ scp -r dist/pw-ac3-live-steamdeck-0.1.0 steamdeck:/home/deck/Downloads/
 **2. Run via SSH:**
 **CRITICAL**: Use `-t` to allocate a pseudo-terminal. This ensures signals (Ctrl+C) are correctly propagated to stop the application cleanly.
 ```bash
-ssh -t -- steamdeck "/home/deck/Downloads/pw-ac3-live-steamdeck-0.1.0/scripts/launch_live_steamdeck.sh"
+ssh -t -- steamdeck "/home/deck/Downloads/pw-ac3-live-steamdeck-0.1.0/scripts/launch_steamdeck.sh"
 ```
 
 **Notes**:
@@ -30,10 +30,10 @@ ssh -t -- steamdeck "/home/deck/Downloads/pw-ac3-live-steamdeck-0.1.0/scripts/la
 - Sets specific ALSA parameters for stability.
 
 ### 2. Laptop / Development (Testing Target)
-**Script**: `./scripts/launch_live_laptop.sh`
+**Script**: `./scripts/launch_laptop.sh`
 **Usage**:
 ```bash
-./scripts/launch_live_laptop.sh
+./scripts/launch_laptop.sh
 ```
 **Notes**:
 - Targets PipeWire node.
@@ -44,8 +44,8 @@ ssh -t -- steamdeck "/home/deck/Downloads/pw-ac3-live-steamdeck-0.1.0/scripts/la
 ### 1. Logging
 The application uses `env_logger`. Control verbosity with `RUST_LOG`.
 ```bash
-RUST_LOG=debug ./scripts/launch_live_laptop.sh
-RUST_LOG=trace ./scripts/launch_live_laptop.sh # Very verbose!
+RUST_LOG=debug ./scripts/launch_laptop.sh
+RUST_LOG=trace ./scripts/launch_laptop.sh # Very verbose!
 ```
 
 ### 2. PipeWire Tools

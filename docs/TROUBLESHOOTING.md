@@ -95,12 +95,6 @@ The native PipeWire path is known to stutter on Steam Deck. Use **Path B (Direct
 
 ### Solution 2: Tune Buffers
 Increase the output buffer size to absorb scheduling jitter.
-```bash
-# Run with larger output buffer (e.g., 6144 or 8192 frames)
-PW_AC3_OUTPUT_BUFFER_SIZE=6144 ./scripts/launch_live_steamdeck.sh
-```
-*If latency increases too much, try reducing `PW_AC3_BUFFER_SIZE` while keeping `OUTPUT_BUFFER_SIZE` high.*
-
 ---
 
 ## 4. Channels are Wrong (Stereo Only)

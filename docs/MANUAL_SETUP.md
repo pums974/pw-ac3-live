@@ -134,8 +134,6 @@ if [ -n "$INTERNAL_PROFILE" ]; then
 fi
 ```
 
-*Tip: `scripts/launch_live_steamdeck.sh` automates this full sequence and is preferred over manual invocation.*
-
 ---
 
 ## Part 5: Routing & Verification

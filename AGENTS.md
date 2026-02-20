@@ -31,14 +31,14 @@ The application supports two distinct output paths. You must understand the diff
 1.  **PipeWire Native** (Default/Laptop):
     - Outputs to a PipeWire node.
     - Standard behavior for desktop Linux.
-    - Uses `scripts/launch_live_laptop.sh`.
+    - Uses `scripts/launch_laptop.sh`.
 
 2.  **Direct ALSA** (Steam Deck):
     - Bypasses PipeWire output graph.
     - Writes encoded stream directly to the ALSA hardware device (`hw:X,Y`).
     - **CRITICAL**: Required on Steam Deck to avoid stuttering/jitter issues inherent to PipeWire's ALSA plugin.
     - **Execution**: Must be run on the Deck. Use `ssh` skill or `ssh -t` to run remotely.
-    - Uses `scripts/launch_live_steamdeck.sh`.
+    - Uses `scripts/launch_steamdeck.sh`.
 
 ## Codebase Structure
 - `src/`: Rust source code.
@@ -46,8 +46,8 @@ The application supports two distinct output paths. You must understand the diff
     - `pipewire_client.rs`: PipeWire IPC and thread management.
     - `encoder.rs`: FFmpeg logic.
 - `scripts/`: Critical runtime scripts.
-    - `launch_live_steamdeck.sh`: **Primary production script** for the target hardware.
-    - `launch_live_laptop.sh`: Dev/Laptop testing script with integrated PipeWire link management.
+    - `launch_steamdeck.sh`: **Primary production script** for the target hardware.
+    - `launch_laptop.sh`: Dev/Laptop testing script with integrated PipeWire link management.
     - `lib/launch_common.sh`: Shared shell helpers used by both launch scripts.
 
 ## Constraints & Behaviors

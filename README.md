@@ -14,8 +14,8 @@ The encoded stream is delivered through one of two possible output paths:
 - **Direct ALSA** — pipes the encoded stream to `aplay` for exclusive hardware access, bypassing the PipeWire graph entirely. Used on platforms like the Steam Deck where PipeWire's ALSA sink plugin introduces unacceptable stuttering or scheduling jitter for encoded bitstreams.
 
 This project has only been tested on the following path:
-* Steam Deck → Valve Dock → HDMI → LG C4 TV → Optical (SPDIF) → Sony DAV-DZ340 (5.1) (uses `scripts/launch_live_steamdeck.sh`)
-* Archlinux laptop → HDMI → LG C4 TV → Optical (SPDIF) → Sony DAV-DZ340 (5.1) (uses `scripts/launch_live_laptop.sh`)
+* Steam Deck → Valve Dock → HDMI → LG C4 TV → Optical (SPDIF) → Sony DAV-DZ340 (5.1) (uses `scripts/launch_steamdeck.sh`)
+* Archlinux laptop → HDMI → LG C4 TV → Optical (SPDIF) → Sony DAV-DZ340 (5.1) (uses `scripts/launch_laptop.sh`)
 
 ## Requirements
 - Rust toolchain
@@ -77,47 +77,18 @@ With the launcher scripts (choose the one for your platform):
 
 ```bash
 # For Steam Deck (hardcoded for Valve Dock + specific HDMI sink)
-./scripts/launch_live_steamdeck.sh
+./scripts/launch_steamdeck.sh
 
-# For Laptop / General Linux (dynamic detection)
-./scripts/launch_live_laptop.sh
+# For Laptop / General Linux (preconfigured PipeWire targets)
+./scripts/launch_laptop.sh
 ```
 
-> **Critical warning (Steam Deck / Direct ALSA):**
-> While `launch_live_steamdeck.sh` is running, **do not suspend/sleep** the system and **do not disconnect HDMI**.
+> **Critical warning:**
+> While `launch_steamdeck.sh` is running, **do not suspend/sleep** the system and **do not disconnect HDMI**.
 > Doing so can leave PipeWire/ALSA card profiles in an inconsistent state (no audio, wrong sink, or noisy output) until manual recovery or reboot.
 > Always stop the script cleanly with `Ctrl+C` before suspend, dock/undock, or HDMI cable changes.
 
-### Script Configuration
-
-The two launcher scripts expose different knobs.
-
-**Laptop (`launch_live_laptop.sh`) options:**
-```bash
-# Optional: lower output ring independently (frames)
-PW_AC3_OUTPUT_BUFFER_SIZE=960 ./scripts/launch_live_laptop.sh
-
-# Optional (loopback-only setups): force app target and link target separately
-PW_AC3_APP_TARGET=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 \
-PW_AC3_CONNECT_TARGET=alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2 \
-./scripts/launch_live_laptop.sh
-```
-
-**Steam Deck (`launch_live_steamdeck.sh`) options:**
-```bash
-# Optional: tune node/ffmpeg pacing
-PW_AC3_NODE_LATENCY=1536/48000 \
-PW_AC3_FFMPEG_THREAD_QUEUE_SIZE=4 \
-PW_AC3_FFMPEG_CHUNK_FRAMES=1536 \
-./scripts/launch_live_steamdeck.sh
-
-# Optional: tune direct ALSA buffering
-PW_AC3_DIRECT_ALSA_BUFFER_TIME=60000 \
-PW_AC3_DIRECT_ALSA_PERIOD_TIME=15000 \
-./scripts/launch_live_steamdeck.sh
-```
-
-**Steam Deck Specifics (`launch_live_steamdeck.sh`):**
+**Steam Deck Specifics (`launch_steamdeck.sh`):**
 - **Output Path**: **Direct ALSA** (`aplay` to `hw:0,8`).
 - **Why?**: PipeWire's ALSA sink introduces choppy audio/stuttering on the Deck.
 - **Hardcoded card/sink IDs**: Aligns with Valve Dock + Steam Deck internals:
@@ -126,11 +97,11 @@ PW_AC3_DIRECT_ALSA_PERIOD_TIME=15000 \
   - Loopback sink: `alsa_loopback_device.alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2`
 - **Behavior**: Disables the internal speaker card profile while running, disables HDMI card profile to release `hw:0,8`, configures IEC958 Non-Audio, then restores IEC958/card profiles/default sink on exit.
 
-**Laptop/Generic Specifics (`launch_live_laptop.sh`):**
+**Laptop/Generic Specifics (`launch_laptop.sh`):**
 - **Output Path**: **PipeWire Native** (in-graph playback stream).
-- **Dynamic Detection**: Scans for `pci` sound cards and `hdmi-stereo` sinks.
-- **Lower Latency**: Defaults to `960` buffer size / `64` frames latency for desktop responsiveness.
-- **Profile Auto-Set**: Attempts to find and set `output:hdmi-stereo` profile on the detected card.
+- **Preconfigured Targets**: Uses fixed `CARD_NAME`, `TARGET_SINK`, `CONNECT_TARGET`, and `TARGET_SINK_INDEX` values in the script (edit these for your machine).
+- **Runtime Defaults**: Starts `pw-ac3-live` with `--latency 64/48000`, `--ffmpeg-thread-queue-size 16`, and `--ffmpeg-chunk-frames 64`.
+- **Startup/Cleanup Automation**: Sets HDMI profile + AC-3 sink format, forces sink volume to `100%`, routes active streams to `pw-ac3-live-input`, links `pw-ac3-live-output` to the configured sink, then restores original default sink/card profile on exit.
 
 ## Manual Setup
 If you prefer to configure everything manually or need to reset your setup from scratch, see [docs/MANUAL_SETUP.md](docs/MANUAL_SETUP.md).
