@@ -25,12 +25,11 @@ amixer -c 0 set "IEC958,2" unmute > /dev/null 2>&1 || true
     --stdout \
     --latency "1536/48000" \
     --ffmpeg-thread-queue-size "4" \
-    --ffmpeg-chunk-frames "1536" 2>/dev/null\
-    | aplay -D hw:0,8 \
-      -t raw -f S16_LE -r 48000 -c 2 \
-      --buffer-time="60000" \
-      --period-time="15000" \
-      >/dev/null 2>&1
+    --ffmpeg-chunk-frames "1536" 2> /dev/null | aplay -D hw:0,8 \
+    -t raw -f S16_LE -r 48000 -c 2 \
+    --buffer-time="60000" \
+    --period-time="15000" \
+    > /dev/null 2>&1
 ) &
 APP_PID=$!
 
