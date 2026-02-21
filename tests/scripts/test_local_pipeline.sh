@@ -32,6 +32,7 @@ DEFAULT_SINK=""
 PIPELINE_PID=""
 RECORD_PID=""
 PLAY_PID=""
+PW_RECORD_EXTRA_ARGS=()
 
 stop_recorder() {
   if [ -z "$RECORD_PID" ]; then
@@ -105,6 +106,11 @@ command -v pactl > /dev/null 2>&1 || {
   error "pactl not found (required for dummy driver)"
   exit 1
 }
+if pw-record --help 2>&1 | grep -q -- "--raw"; then
+  PW_RECORD_EXTRA_ARGS+=(--raw)
+else
+  log "pw-record --raw is not supported on this host; using default output mode"
+fi
 
 # Ensure we don't validate stale artifacts from previous runs.
 rm -f "$OUTPUT_FILE" "$INTERMEDIATE_FILE" "$PIPELINE_LOG" "$RECORD_LOG"
@@ -200,8 +206,8 @@ done
 
 # 7. Start Recording (from sink monitor path)
 log "Starting recorder on $SINK_NAME monitor capture..."
-# Force raw stream to stdout and redirect it into OUTPUT_FILE.
-pw-record --target "$SINK_NAME" -P stream.capture.sink=true --raw --format s16 --rate "$SAMPLE_RATE" --channels 2 - > "$OUTPUT_FILE" 2> "$RECORD_LOG" &
+# Capture to stdout and redirect into OUTPUT_FILE.
+pw-record --target "$SINK_NAME" -P stream.capture.sink=true "${PW_RECORD_EXTRA_ARGS[@]}" --format s16 --rate "$SAMPLE_RATE" --channels 2 - > "$OUTPUT_FILE" 2> "$RECORD_LOG" &
 RECORD_PID=$!
 sleep 0.5
 if ! kill -0 "$RECORD_PID" 2> /dev/null; then
