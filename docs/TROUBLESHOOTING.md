@@ -40,8 +40,8 @@ pactl set-sink-volume pw-ac3-live-input 100%
 ```
 
 ### Fix 2: Force "Non-Audio" Bit (Direct ALSA / Steam Deck)
-If using the **Direct ALSA** path, the IEC958 status bits must be set to "Non-Audio" so the receiver knows it's a data stream (AC-3), not PCM audio.
-Run this for your card (e.g., card 0):
+In `--alsa-direct` mode, the app already sets IEC958 to "Non-Audio" at startup and restores it on exit.
+If your system still reports PCM and passthrough fails, force it manually for your card (e.g., card 0):
 ```bash
 # Try indices 0-3 to be safe
 iecset -c 0 -n 0 audio off rate 48000
@@ -79,9 +79,9 @@ pactl set-card-profile <CARD_NAME> output:hdmi-stereo
     Check `wpctl status` for any `[MUTED]` tags on your HDMI sink or the encoder input.
 
 4.  **Is Direct ALSA blocked?**
-    If using Path B, check `aplay` logs for "Device or resource busy".
+    If using Path B, run with logs and check for ALSA open errors ("Device or resource busy", "Permission denied").
     ```bash
-    cat /tmp/aplay.log
+    RUST_LOG=info ./target/release/pw-ac3-live --alsa-direct --target hw:0,8
     ```
 
 ---
@@ -120,7 +120,6 @@ If audio is completely stuck:
 ```bash
 # 1. Kill everything
 pkill -INT -f pw-ac3-live
-pkill -INT -f aplay
 
 # 2. Reset ALSA state (optional but helpful)
 alsactl restore

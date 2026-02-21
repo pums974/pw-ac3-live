@@ -108,13 +108,12 @@ echo "  $(date '+%Y-%m-%d %H:%M:%S')"
 # ── 1. Dependencies ───────────────────────────────────────────────────
 header "Dependencies"
 
-DEPS=(ffmpeg aplay iecset pactl pw-cli pw-link pw-play pw-cat pw-metadata wpctl)
+DEPS=(ffmpeg iecset amixer pactl pw-cli pw-link pw-play pw-cat pw-metadata wpctl)
 for dep in "${DEPS[@]}"; do
   if command -v "$dep" > /dev/null 2>&1; then
     ver=""
     case "$dep" in
       ffmpeg) ver=$(ffmpeg -version 2> /dev/null | head -1 | awk '{print $3}') ;;
-      aplay) ver=$(aplay --version 2> /dev/null | grep -oP '\d+\.\d+[\w.-]*' | head -1) ;;
       pw-cli) ver=$(pw-cli --version 2> /dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || true) ;;
     esac
     check "$dep" "$PASS" "${ver:+v$ver}"
@@ -124,7 +123,7 @@ for dep in "${DEPS[@]}"; do
         check "$dep" "$FAIL" "not found"
         FAILURES=$((FAILURES + 1))
         ;;
-      iecset | wpctl | pw-metadata | pw-cat)
+      iecset | amixer | wpctl | pw-metadata | pw-cat)
         check "$dep" "$INFO" "not found (optional)"
         ;;
       *)

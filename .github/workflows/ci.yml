@@ -87,8 +87,17 @@ jobs:
         mkdir -p "$XDG_RUNTIME_DIR"
         chmod 0700 "$XDG_RUNTIME_DIR"
 
-        # Quick test that doesn't need PipeWire
-        bash tests/scripts/test_ci_help.sh
+        # Run integration tests that do not require a live PipeWire session.
+        for test_script in tests/scripts/test_ci_*.sh; do
+          test_name="$(basename "$test_script")"
+          case "$test_name" in
+            test_ci_help.sh|test_ci_alsa_args.sh)
+              echo "═══ Running $test_name (no PipeWire session required) ═══"
+              bash "$test_script"
+              echo ""
+              ;;
+          esac
+        done
 
         # Start PipeWire stack inside a private D-Bus session
         dbus-run-session bash -c '
@@ -112,21 +121,29 @@ jobs:
           echo "PipeWire stack started (pw=$PW_PID wp=$WP_PID pp=$PP_PID)"
           pw-cli info 0 || { echo "PipeWire not responding"; exit 1; }
 
-          # Run all integration tests
-          echo "═══ Running pipeline test ═══"
-          bash tests/scripts/test_ci_pipeline.sh
+          # Run integration tests that require an active PipeWire session.
+          for test_script in tests/scripts/test_ci_*.sh; do
+            test_name="$(basename "$test_script")"
+            case "$test_name" in
+              test_ci_help.sh|test_ci_alsa_args.sh)
+                continue
+                ;;
+            esac
 
-          echo ""
-          echo "═══ Running SIGINT shutdown test ═══"
-          bash tests/scripts/test_ci_sigint.sh
+            echo "═══ Running $test_name ═══"
+            bash "$test_script"
+            echo ""
+          done
 
-          echo ""
-          echo "═══ Running idle shutdown test ═══"
-          bash tests/scripts/test_ci_idle_shutdown.sh
-
-          echo ""
-          echo "═══ Running stereo input test ═══"
-          bash tests/scripts/test_ci_stereo_input.sh
+          # Run longer end-to-end integration suites.
+          for test_script in tests/scripts/test_local_pipeline.sh tests/scripts/test_pipewire_pipeline.sh; do
+            if [ -f "$test_script" ]; then
+              test_name="$(basename "$test_script")"
+              echo "═══ Running $test_name ═══"
+              bash "$test_script"
+              echo ""
+            fi
+          done
 
           # Cleanup
           kill $PP_PID $WP_PID $PW_PID 2>/dev/null || true

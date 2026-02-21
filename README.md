@@ -9,9 +9,10 @@ I only have a limited knowledge of the tools used in this project (Rust, PipeWir
 ## Purpose
 Some HDMI sinks expose only stereo PCM but still accept AC-3 passthrough. This project creates a virtual 5.1 sink, encodes incoming audio to AC-3 with `ffmpeg`, and outputs an IEC61937 stream for playback.
 
-The encoded stream is delivered through one of two possible output paths:
+The encoded stream is delivered through one of three possible output paths:
 - **PipeWire Native** — plays back through a PipeWire output source node within the graph. Used on standard Linux desktops.
-- **Direct ALSA** — pipes the encoded stream to `aplay` for exclusive hardware access, bypassing the PipeWire graph entirely. Used on platforms like the Steam Deck where PipeWire's ALSA sink plugin introduces unacceptable stuttering or scheduling jitter for encoded bitstreams.
+- **Direct ALSA** — writes the encoded stream directly to an ALSA hardware device from Rust, bypassing the PipeWire graph entirely. Used on platforms like the Steam Deck where PipeWire's ALSA sink plugin introduces unacceptable stuttering or scheduling jitter for encoded bitstreams.
+- **Stdout Manual Pipe** — writes encoded IEC61937 bytes to `stdout` (`--stdout`) so you can manually route them to `pw-play`, `aplay`, or a file. Useful for debugging and custom pipelines.
 
 This project has only been tested on the following path:
 * Steam Deck → Valve Dock → HDMI → LG C4 TV → Optical (SPDIF) → Sony DAV-DZ340 (5.1) (uses `scripts/launch_steamdeck.sh`)
@@ -49,6 +50,20 @@ cargo run --release -- --target 42
 # Write IEC61937 bytes to stdout (no PipeWire playback stream)
 cargo run --release -- --stdout > output.spdif
 
+# Path C: manually pipe stdout to PipeWire
+cargo run --release -- --stdout \
+  | pw-play --target <your-sink-node> --raw --format s16 --rate 48000 --channels 2 -
+
+# Path C: manually pipe stdout to ALSA
+cargo run --release -- --stdout \
+  | aplay -D hw:0,8 -t raw -f S16_LE -r 48000 -c 2 --buffer-time=60000 --period-time=15000
+
+# Write IEC61937 bytes directly to ALSA hardware (no PipeWire playback stream)
+cargo run --release -- --alsa-direct --target hw:0,8 \
+  --alsa-latency-us 60000 \
+  --alsa-iec-card 0 \
+  --alsa-iec-index 2
+
 # Lower latency profile (good starting point)
 cargo run --release -- --target <your-hdmi-node> \
   --buffer-size 960 \
@@ -62,8 +77,11 @@ cargo run --release -- --target <your-hdmi-node> --profile-latency
 ```
 
 `--target` accepts either a node name or a numeric object ID. Numeric values are applied to both the stream connect target and `target.object` properties. Name values are applied as `target.object`.
+With `--alsa-direct`, `--target` is interpreted as an ALSA device string (for example `hw:0,8`).
 
 `--stdout` mode drains buffered encoder output and exits cleanly on shutdown.
+`--alsa-direct` enables direct ALSA playback from the Rust process (no `aplay` subprocess).
+`--alsa-iec-card` and `--alsa-iec-index` select which IEC958 control the app toggles in direct ALSA mode. Both are required with `--alsa-direct`.
 
 Latency-related knobs:
 - `--buffer-size`: app ring buffer size in frames (default `4800`).
@@ -71,6 +89,8 @@ Latency-related knobs:
 - `--latency`: PipeWire node latency target (default `64/48000`).
 - `--ffmpeg-thread-queue-size`: FFmpeg input queue depth (default `128`).
 - `--ffmpeg-chunk-frames`: frame batch size written to FFmpeg (default `128`).
+- `--alsa-iec-card`: ALSA card used by `iecset`/`amixer` in direct ALSA mode (required with `--alsa-direct`).
+- `--alsa-iec-index`: IEC958 index used by `iecset`/`amixer` in direct ALSA mode (required with `--alsa-direct`).
 - `--profile-latency`: emits per-stage latency stats (`avg/p50/p95/max`) every second.
 
 With the launcher scripts (choose the one for your platform):
@@ -89,19 +109,24 @@ With the launcher scripts (choose the one for your platform):
 > Always stop the script cleanly with `Ctrl+C` before suspend, dock/undock, or HDMI cable changes.
 
 **Steam Deck Specifics (`launch_steamdeck.sh`):**
-- **Output Path**: **Direct ALSA** (`aplay` to `hw:0,8`).
+- **Output Path**: **Direct ALSA** (Rust ALSA writer to `hw:0,8`).
 - **Why?**: PipeWire's ALSA sink introduces choppy audio/stuttering on the Deck.
 - **Hardcoded card/sink IDs**: Aligns with Valve Dock + Steam Deck internals:
   - HDMI card: `alsa_card.pci-0000_04_00.1`
   - Internal speaker card: `alsa_card.pci-0000_04_00.5-platform-nau8821-max`
   - Loopback sink: `alsa_loopback_device.alsa_output.pci-0000_04_00.1.hdmi-stereo-extra2`
-- **Behavior**: Disables the internal speaker card profile while running, disables HDMI card profile to release `hw:0,8`, configures IEC958 Non-Audio, then restores IEC958/card profiles/default sink on exit.
+- **Behavior**: The script disables the HDMI card profile to release `hw:0,8` and restores PipeWire defaults on exit; in `--alsa-direct` mode the app itself configures IEC958 Non-Audio + ALSA mixer unmute and restores IEC958 Audio mode on shutdown.
 
 **Laptop/Generic Specifics (`launch_laptop.sh`):**
 - **Output Path**: **PipeWire Native** (in-graph playback stream).
 - **Preconfigured Targets**: Uses fixed `CARD_NAME`, `TARGET_SINK`, `CONNECT_TARGET`, and `TARGET_SINK_INDEX` values in the script (edit these for your machine).
 - **Runtime Defaults**: Starts `pw-ac3-live` with `--latency 64/48000`, `--ffmpeg-thread-queue-size 16`, and `--ffmpeg-chunk-frames 64`.
 - **Startup/Cleanup Automation**: Sets HDMI profile + AC-3 sink format, forces sink volume to `100%`, routes active streams to `pw-ac3-live-input`, links `pw-ac3-live-output` to the configured sink, then restores original default sink/card profile on exit.
+
+**Manual/Advanced Specifics (Path C via `--stdout`):**
+- **Output Path**: **Stdout Manual Pipe**.
+- **Use case**: You want to control the final transport yourself (`pw-play`, `aplay`, `tee`, custom processing).
+- **Trade-off**: You manage process chaining and lifecycle manually.
 
 ## Manual Setup
 If you prefer to configure everything manually or need to reset your setup from scratch, see [docs/MANUAL_SETUP.md](docs/MANUAL_SETUP.md).
@@ -113,7 +138,7 @@ For common issues (noise, silence, lag) and their fixes, see [docs/TROUBLESHOOTI
 
 ## Runtime nodes
 - Input node: `pw-ac3-live-input` (PipeWire sink, 6 channels, F32LE)
-- Output node: `pw-ac3-live-output` (PipeWire source, S16LE IEC61937 payload) unless `--stdout` is enabled
+- Output node: `pw-ac3-live-output` (PipeWire source, S16LE IEC61937 payload) unless `--stdout` or `--alsa-direct` is enabled
 
 The capture side supports both layouts commonly exposed by PipeWire:
 - single interleaved buffer (`datas=1`, typically with stride),

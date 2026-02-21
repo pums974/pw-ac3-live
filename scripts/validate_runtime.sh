@@ -105,11 +105,11 @@ else
   check "FFmpeg encoder subprocess" "$INFO" "not running"
 fi
 
-APLAY_PIDS=$(pgrep -f "aplay.*S16_LE" 2> /dev/null | head -5 || true)
-if [ -n "$APLAY_PIDS" ]; then
-  check "Direct ALSA aplay process" "$PASS" "PID(s): $(echo $APLAY_PIDS | tr '\n' ' ')"
+DIRECT_ALSA_PIDS=$(pgrep -f "pw-ac3-live.*--alsa-direct" 2> /dev/null | head -5 || true)
+if [ -n "$DIRECT_ALSA_PIDS" ]; then
+  check "Direct ALSA mode (--alsa-direct)" "$PASS" "PID(s): $(echo $DIRECT_ALSA_PIDS | tr '\n' ' ')"
 else
-  check "Direct ALSA aplay process" "$INFO" "not running"
+  check "Direct ALSA mode (--alsa-direct)" "$INFO" "not running"
 fi
 
 # ── 3. PipeWire graph ────────────────────────────────────────────────

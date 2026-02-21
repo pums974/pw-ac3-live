@@ -44,4 +44,22 @@ if ! echo "$OUTPUT" | grep -q -- "--target"; then
   exit 1
 fi
 
+if ! echo "$OUTPUT" | grep -q -- "--alsa-direct"; then
+  error "--help output doesn't mention --alsa-direct flag"
+  echo "$OUTPUT"
+  exit 1
+fi
+
+if ! echo "$OUTPUT" | grep -q -- "--alsa-iec-card"; then
+  error "--help output doesn't mention --alsa-iec-card flag"
+  echo "$OUTPUT"
+  exit 1
+fi
+
+if ! echo "$OUTPUT" | grep -q -- "--alsa-iec-index"; then
+  error "--help output doesn't mention --alsa-iec-index flag"
+  echo "$OUTPUT"
+  exit 1
+fi
+
 log "✓ --help exits cleanly and shows expected flags"

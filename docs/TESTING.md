@@ -12,6 +12,9 @@ Run focused suites:
 ```bash
 cargo test --test encoder_tests
 cargo test --test pipewire_client_tests
+cargo test --test alsa_control_tests
+./tests/scripts/test_ci_help.sh
+./tests/scripts/test_ci_alsa_args.sh
 ```
 
 Current regression coverage includes:

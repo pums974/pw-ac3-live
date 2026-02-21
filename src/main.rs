@@ -16,13 +16,33 @@ use pw_ac3_live::pipewire_client;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Target PipeWire Node ID or Name for playback (the HDMI sink)
+    /// Playback target:
+    /// - PipeWire mode: Node ID or node name
+    /// - --alsa-direct mode: ALSA device (e.g. hw:0,8)
     #[arg(short, long)]
     target: Option<String>,
 
     /// Output to stdout instead of PipeWire playback
-    #[arg(long, action)]
+    #[arg(long, action, conflicts_with = "alsa_direct")]
     stdout: bool,
+
+    /// Enable direct ALSA output mode (uses --target as ALSA device, e.g. --target hw:0,8).
+    #[arg(long, action, conflicts_with = "stdout")]
+    alsa_direct: bool,
+
+    /// Target ALSA playback latency in microseconds (used with --alsa-direct).
+    #[arg(long, default_value_t = 60_000, requires = "alsa_direct")]
+    alsa_latency_us: u32,
+
+    /// ALSA card identifier used by iecset/amixer in --alsa-direct mode.
+    /// Required with --alsa-direct.
+    #[arg(long, requires = "alsa_direct")]
+    alsa_iec_card: Option<String>,
+
+    /// IEC958 control index used by iecset/amixer in --alsa-direct mode.
+    /// Required with --alsa-direct.
+    #[arg(long, requires = "alsa_direct")]
+    alsa_iec_index: Option<String>,
 
     /// Ring buffer capacity in audio frames (samples per channel)
     /// Default is approx 100ms at 48kHz
@@ -50,9 +70,27 @@ struct Args {
 fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
+    let target = args
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(str::to_owned);
+    let alsa_iec_card = args
+        .alsa_iec_card
+        .as_deref()
+        .map(str::trim)
+        .filter(|card| !card.is_empty())
+        .map(str::to_owned);
+    let alsa_iec_index = args
+        .alsa_iec_index
+        .as_deref()
+        .map(str::trim)
+        .filter(|index| !index.is_empty())
+        .map(str::to_owned);
 
     info!("Starting pw-ac3-live...");
-    info!("Target Sink: {:?}", args.target);
+    info!("Target: {:?}", target);
     info!("Buffer Size: {}", args.buffer_size);
     info!(
         "Output Buffer Size: {}",
@@ -63,6 +101,54 @@ fn main() -> Result<()> {
         "FFmpeg queue/chunk: {} / {}",
         args.ffmpeg_thread_queue_size, args.ffmpeg_chunk_frames
     );
+    if args.stdout {
+        info!("Output mode: stdout");
+    } else if args.alsa_direct {
+        info!(
+            "Output mode: direct ALSA ({}, latency={}us, iec_card={}, iec_index={})",
+            target.as_deref().unwrap_or("<missing --target>"),
+            args.alsa_latency_us,
+            alsa_iec_card
+                .as_deref()
+                .unwrap_or("<missing --alsa-iec-card>"),
+            alsa_iec_index
+                .as_deref()
+                .unwrap_or("<missing --alsa-iec-index>")
+        );
+    } else {
+        info!("Output mode: PipeWire playback stream");
+    }
+
+    if args.alsa_direct && target.is_none() {
+        return Err(anyhow!(
+            "--alsa-direct requires --target <alsa-device>, e.g. --target hw:0,8"
+        ));
+    }
+    if args.alsa_direct && alsa_iec_card.is_none() {
+        return Err(anyhow!(
+            "--alsa-direct requires --alsa-iec-card <card-id>, e.g. --alsa-iec-card 0"
+        ));
+    }
+    if args.alsa_direct && alsa_iec_index.is_none() {
+        return Err(anyhow!(
+            "--alsa-direct requires --alsa-iec-index <iec-index>, e.g. --alsa-iec-index 2"
+        ));
+    }
+
+    // In direct ALSA mode, apply the same best-effort IEC958/mixer setup
+    // that was previously done by the launcher script.
+    let _direct_alsa_hw_guard = if args.alsa_direct {
+        Some(pw_ac3_live::alsa_control::DirectAlsaHardwareGuard::setup(
+            alsa_iec_card
+                .clone()
+                .ok_or_else(|| anyhow!("--alsa-direct requires --alsa-iec-card"))?,
+            alsa_iec_index
+                .clone()
+                .ok_or_else(|| anyhow!("--alsa-direct requires --alsa-iec-index"))?,
+        ))
+    } else {
+        None
+    };
 
     // 1. Setup RingBuffers
     // SPSC (Single Producer Single Consumer) lock-free queues.
@@ -110,11 +196,27 @@ fn main() -> Result<()> {
     let pipewire_config = pipewire_client::PipewireConfig {
         node_latency: args.latency,
     };
+    let (pipewire_target, output_mode) = if args.alsa_direct {
+        let device = target
+            .clone()
+            .ok_or_else(|| anyhow!("--alsa-direct requires --target <alsa-device>"))?;
+        (
+            None,
+            pipewire_client::OutputMode::AlsaDirect {
+                device,
+                latency_us: args.alsa_latency_us,
+            },
+        )
+    } else if args.stdout {
+        (None, pipewire_client::OutputMode::Stdout)
+    } else {
+        (target, pipewire_client::OutputMode::Pipewire)
+    };
     let pipewire_result = pipewire_client::run_pipewire_loop_with_config(
         input_producer,
         output_consumer,
-        args.target,
-        args.stdout,
+        pipewire_target,
+        output_mode,
         running.clone(),
         pipewire_config,
     );

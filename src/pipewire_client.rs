@@ -14,6 +14,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::{
+    ffi::{CStr, CString},
+    ptr,
+};
 
 const INPUT_CHANNELS: usize = 6;
 const OUTPUT_CHANNELS: usize = 2;
@@ -21,6 +26,7 @@ const SAMPLE_RATE: &str = "48000";
 const SAMPLE_RATE_HZ: u32 = 48_000;
 const STDOUT_READ_BUFFER_SIZE: usize = 4096;
 const OUTPUT_FRAME_BYTES: usize = OUTPUT_CHANNELS * size_of::<i16>();
+const DEFAULT_ALSA_LATENCY_US: u32 = 60_000;
 
 #[derive(Debug, Clone)]
 pub struct PipewireConfig {
@@ -33,6 +39,13 @@ impl Default for PipewireConfig {
             node_latency: "64/48000".to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum OutputMode {
+    Pipewire,
+    Stdout,
+    AlsaDirect { device: String, latency_us: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +100,191 @@ fn build_playback_properties(target: &PlaybackTarget) -> pw::properties::Propert
     }
 
     playback_props
+}
+
+#[cfg(target_os = "linux")]
+mod alsa_output {
+    use super::*;
+    use libc::{c_char, c_int, c_uint, c_void};
+
+    type SndPcmUframes = libc::c_ulong;
+    type SndPcmSframes = libc::c_long;
+
+    const SND_PCM_STREAM_PLAYBACK: c_int = 0;
+    const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
+    const SND_PCM_FORMAT_S16_LE: c_int = 2;
+
+    #[repr(C)]
+    struct SndPcmHandle {
+        _private: [u8; 0],
+    }
+
+    #[link(name = "asound")]
+    unsafe extern "C" {
+        fn snd_pcm_open(
+            pcmp: *mut *mut SndPcmHandle,
+            name: *const c_char,
+            stream: c_int,
+            mode: c_int,
+        ) -> c_int;
+        fn snd_pcm_close(pcm: *mut SndPcmHandle) -> c_int;
+        fn snd_pcm_prepare(pcm: *mut SndPcmHandle) -> c_int;
+        fn snd_pcm_drain(pcm: *mut SndPcmHandle) -> c_int;
+        fn snd_pcm_recover(pcm: *mut SndPcmHandle, err: c_int, silent: c_int) -> c_int;
+        fn snd_pcm_set_params(
+            pcm: *mut SndPcmHandle,
+            format: c_int,
+            access: c_int,
+            channels: c_uint,
+            rate: c_uint,
+            soft_resample: c_int,
+            latency: c_uint,
+        ) -> c_int;
+        fn snd_pcm_writei(
+            pcm: *mut SndPcmHandle,
+            buffer: *const c_void,
+            size: SndPcmUframes,
+        ) -> SndPcmSframes;
+        fn snd_strerror(errnum: c_int) -> *const c_char;
+    }
+
+    fn alsa_error(context: &str, err: c_int) -> anyhow::Error {
+        // SAFETY: `snd_strerror` returns a pointer to a static NUL-terminated error string
+        // for any ALSA error code. We only read it immediately and convert lossily.
+        let detail = unsafe {
+            let ptr = snd_strerror(err);
+            if ptr.is_null() {
+                format!("errno={err}")
+            } else {
+                CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            }
+        };
+
+        anyhow!("{context}: {detail} (code {err})")
+    }
+
+    pub(super) struct AlsaPlayback {
+        handle: *mut SndPcmHandle,
+    }
+
+    impl AlsaPlayback {
+        pub(super) fn open(device: &str, latency_us: u32) -> Result<Self> {
+            let mut handle = ptr::null_mut();
+            let device_cstr =
+                CString::new(device).context("ALSA device contains interior NUL bytes")?;
+
+            // SAFETY: `device_cstr` lives for the duration of this call, `handle` is a valid
+            // out-pointer, and we request playback mode with no special flags.
+            let open_result = unsafe {
+                snd_pcm_open(
+                    &mut handle,
+                    device_cstr.as_ptr(),
+                    SND_PCM_STREAM_PLAYBACK,
+                    0,
+                )
+            };
+            if open_result < 0 {
+                return Err(alsa_error(
+                    &format!("Failed to open ALSA playback device '{device}'"),
+                    open_result,
+                ));
+            }
+
+            // SAFETY: `handle` was successfully returned by ALSA and is valid until closed.
+            let params_result = unsafe {
+                snd_pcm_set_params(
+                    handle,
+                    SND_PCM_FORMAT_S16_LE,
+                    SND_PCM_ACCESS_RW_INTERLEAVED,
+                    OUTPUT_CHANNELS as c_uint,
+                    SAMPLE_RATE_HZ,
+                    0,
+                    latency_us,
+                )
+            };
+            if params_result < 0 {
+                // SAFETY: `handle` was opened above; we close it on configuration failure.
+                let _ = unsafe { snd_pcm_close(handle) };
+                return Err(alsa_error(
+                    &format!(
+                        "Failed to configure ALSA device '{device}' ({} Hz, {}ch, S16LE, latency={}us)",
+                        SAMPLE_RATE_HZ, OUTPUT_CHANNELS, latency_us
+                    ),
+                    params_result,
+                ));
+            }
+
+            // SAFETY: `handle` is valid and configured; prepare transitions to a ready state.
+            let prepare_result = unsafe { snd_pcm_prepare(handle) };
+            if prepare_result < 0 {
+                // SAFETY: `handle` was opened above; we close it on configuration failure.
+                let _ = unsafe { snd_pcm_close(handle) };
+                return Err(alsa_error(
+                    &format!("Failed to prepare ALSA device '{device}'"),
+                    prepare_result,
+                ));
+            }
+
+            Ok(Self { handle })
+        }
+
+        pub(super) fn write_all(&mut self, data: &[u8]) -> Result<()> {
+            let frame_count = data.len() / OUTPUT_FRAME_BYTES;
+            if frame_count == 0 {
+                return Ok(());
+            }
+
+            let mut written_frames = 0usize;
+            while written_frames < frame_count {
+                let offset_bytes = written_frames * OUTPUT_FRAME_BYTES;
+                let ptr = data[offset_bytes..].as_ptr() as *const c_void;
+                let frames_left = (frame_count - written_frames) as SndPcmUframes;
+
+                // SAFETY: `self.handle` is a valid opened PCM handle. `ptr` points to
+                // `frames_left * frame_size` bytes of initialized memory for this call.
+                let ret = unsafe { snd_pcm_writei(self.handle, ptr, frames_left) };
+                if ret > 0 {
+                    written_frames += ret as usize;
+                    continue;
+                }
+                if ret == 0 {
+                    thread::sleep(Duration::from_micros(200));
+                    continue;
+                }
+
+                // SAFETY: `self.handle` is valid and `ret` is an ALSA negative error code
+                // returned by `snd_pcm_writei`.
+                let recover = unsafe { snd_pcm_recover(self.handle, ret as c_int, 1) };
+                if recover < 0 {
+                    return Err(alsa_error("ALSA write/recover failed", recover));
+                }
+            }
+
+            Ok(())
+        }
+
+        pub(super) fn drain(&mut self) {
+            // SAFETY: `self.handle` is a valid opened PCM handle.
+            let drain_result = unsafe { snd_pcm_drain(self.handle) };
+            if drain_result < 0 {
+                log::warn!(
+                    "ALSA drain failed during shutdown: {}",
+                    alsa_error("snd_pcm_drain", drain_result)
+                );
+            }
+        }
+    }
+
+    impl Drop for AlsaPlayback {
+        fn drop(&mut self) {
+            if self.handle.is_null() {
+                return;
+            }
+            // SAFETY: `self.handle` is owned by this struct and has not been closed yet.
+            let _ = unsafe { snd_pcm_close(self.handle) };
+            self.handle = ptr::null_mut();
+        }
+    }
 }
 
 fn parse_f32_plane_into(
@@ -220,6 +418,68 @@ fn run_stdout_output_loop<W: Write>(
     Ok(())
 }
 
+fn run_alsa_output_loop(
+    output_consumer: &mut Consumer<u8>,
+    running: &AtomicBool,
+    device: &str,
+    latency_us: u32,
+) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = output_consumer;
+        let _ = running;
+        let _ = device;
+        let _ = latency_us;
+        return Err(anyhow!("--alsa-direct is only supported on Linux"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut alsa = alsa_output::AlsaPlayback::open(device, latency_us)?;
+        let mut read_buffer = [0u8; STDOUT_READ_BUFFER_SIZE];
+        let mut staging_buffer = [0u8; STDOUT_READ_BUFFER_SIZE + OUTPUT_FRAME_BYTES];
+        let mut staged_len = 0usize;
+
+        while running.load(Ordering::Relaxed) || output_consumer.slots() > 0 {
+            match output_consumer.read(&mut read_buffer) {
+                Ok(read) if read > 0 => {
+                    let writable = read.min(staging_buffer.len().saturating_sub(staged_len));
+                    if writable == 0 {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+
+                    staging_buffer[staged_len..staged_len + writable]
+                        .copy_from_slice(&read_buffer[..writable]);
+                    staged_len += writable;
+
+                    let aligned = staged_len - (staged_len % OUTPUT_FRAME_BYTES);
+                    if aligned > 0 {
+                        alsa.write_all(&staging_buffer[..aligned])?;
+                        let remainder = staged_len - aligned;
+                        if remainder > 0 {
+                            staging_buffer.copy_within(aligned..staged_len, 0);
+                        }
+                        staged_len = remainder;
+                    }
+                }
+                Ok(_) | Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+
+        if staged_len > 0 {
+            log::warn!(
+                "Dropping {} trailing byte(s) not aligned to {}-byte audio frames",
+                staged_len,
+                OUTPUT_FRAME_BYTES
+            );
+        }
+
+        alsa.drain();
+        Ok(())
+    }
+}
+
 fn build_audio_raw_format_param(format: AudioFormat, channels: u32) -> Result<Vec<u8>> {
     let mut audio_info = AudioInfoRaw::new();
     audio_info.set_format(format);
@@ -267,11 +527,17 @@ pub fn run_pipewire_loop(
     use_stdout: bool,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
+    let output_mode = if use_stdout {
+        OutputMode::Stdout
+    } else {
+        OutputMode::Pipewire
+    };
+
     run_pipewire_loop_with_config(
         input_producer,
         output_consumer,
         target_node,
-        use_stdout,
+        output_mode,
         running,
         PipewireConfig::default(),
     )
@@ -281,7 +547,7 @@ pub fn run_pipewire_loop_with_config(
     input_producer: Producer<f32>,
     mut output_consumer: Consumer<u8>,
     target_node: Option<String>,
-    use_stdout: bool,
+    output_mode: OutputMode,
     running: Arc<AtomicBool>,
     config: PipewireConfig,
 ) -> Result<()> {
@@ -532,83 +798,116 @@ pub fn run_pipewire_loop_with_config(
     let _playback_listener_handle;
     let playback_target = resolve_playback_target(target_node.as_deref());
 
-    if use_stdout {
-        // Shrink the process stdout pipe buffer to minimize latency to aplay.
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            let stdout_fd = std::io::stdout().as_raw_fd();
-            const F_SETPIPE_SZ: libc::c_int = 1031;
-            const F_GETPIPE_SZ: libc::c_int = 1032;
-            let old = unsafe { libc::fcntl(stdout_fd, F_GETPIPE_SZ) };
-            let ret = unsafe { libc::fcntl(stdout_fd, F_SETPIPE_SZ, 4096 as libc::c_int) };
-            if ret > 0 {
-                info!("Shrunk process stdout pipe from {} to {} bytes", old, ret);
+    match output_mode {
+        OutputMode::Stdout => {
+            // Shrink the process stdout pipe buffer to minimize end-to-end buffering.
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::io::AsRawFd;
+                let stdout_fd = std::io::stdout().as_raw_fd();
+                const F_SETPIPE_SZ: libc::c_int = 1031;
+                const F_GETPIPE_SZ: libc::c_int = 1032;
+
+                // SAFETY: `stdout_fd` is owned by this process and valid for `fcntl`.
+                let old = unsafe { libc::fcntl(stdout_fd, F_GETPIPE_SZ) };
+                // SAFETY: same as above; we only request a smaller kernel pipe size.
+                let ret = unsafe { libc::fcntl(stdout_fd, F_SETPIPE_SZ, 4096 as libc::c_int) };
+                if ret > 0 {
+                    info!("Shrunk process stdout pipe from {} to {} bytes", old, ret);
+                } else {
+                    log::warn!(
+                        "Could not shrink process stdout pipe: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+
+            // Spawn a thread to read from ring buffer and write to stdout.
+            let running_clone = running.clone();
+            thread::spawn(move || {
+                let mut stdout = std::io::stdout().lock();
+                if let Err(e) = run_stdout_output_loop(
+                    &mut output_consumer,
+                    running_clone.as_ref(),
+                    &mut stdout,
+                ) {
+                    log::error!("Failed to write to stdout: {}", e);
+                    std::process::exit(1);
+                }
+            });
+            info!("Outputting to stdout (playback stream disabled).");
+            _playback_stream_handle = None;
+            _playback_listener_handle = None;
+        }
+        OutputMode::AlsaDirect { device, latency_us } => {
+            let alsa_latency_us = if latency_us == 0 {
+                DEFAULT_ALSA_LATENCY_US
             } else {
-                log::warn!(
-                    "Could not shrink process stdout pipe: {}",
-                    std::io::Error::last_os_error()
+                latency_us
+            };
+            let device_for_thread = device.clone();
+            let running_clone = running.clone();
+            thread::spawn(move || {
+                if let Err(e) = run_alsa_output_loop(
+                    &mut output_consumer,
+                    running_clone.as_ref(),
+                    &device_for_thread,
+                    alsa_latency_us,
+                ) {
+                    log::error!("Direct ALSA output loop failed: {e:#}");
+                    std::process::exit(1);
+                }
+            });
+            info!(
+                "Outputting directly to ALSA device '{}' (latency={}us, playback stream disabled).",
+                device, alsa_latency_us
+            );
+            _playback_stream_handle = None;
+            _playback_listener_handle = None;
+        }
+        OutputMode::Pipewire => {
+            // Create Playback Stream (Output to HDMI/Sink)
+
+            // Strategy: Use properties for Audio/Source
+            let mut playback_props = build_playback_properties(&playback_target);
+            playback_props.insert("node.latency", node_latency);
+            if let Some(frames) = requested_latency_frames {
+                let force_quantum = frames.to_string();
+                playback_props.insert("node.force-quantum", force_quantum.as_str());
+                playback_props.insert("node.lock-quantum", "true");
+                playback_props.insert("node.force-rate", SAMPLE_RATE);
+                playback_props.insert("node.lock-rate", "true");
+                info!(
+                    "Playback stream requesting forced quantum/rate: {} frames @ {} Hz",
+                    frames, SAMPLE_RATE_HZ
                 );
             }
-        }
 
-        // Spawn a thread to read from ring buffer and write to stdout
-        let running_clone = running.clone();
-        thread::spawn(move || {
-            let mut stdout = std::io::stdout().lock();
-            if let Err(e) =
-                run_stdout_output_loop(&mut output_consumer, running_clone.as_ref(), &mut stdout)
-            {
-                log::error!("Failed to write to stdout: {}", e);
-                std::process::exit(1);
+            let output_ring_capacity_bytes = output_consumer.buffer().capacity();
+            let playback_target_quantum_bytes = requested_latency_frames
+                .map(|frames| frames.saturating_mul(OUTPUT_FRAME_BYTES))
+                .filter(|bytes| *bytes > 0)
+                .unwrap_or(0);
+
+            if playback_target_quantum_bytes > 0 {
+                info!(
+                    "Playback target quantum: {} frames / {} bytes (ring capacity: {} bytes)",
+                    requested_latency_frames.unwrap_or(0),
+                    playback_target_quantum_bytes,
+                    output_ring_capacity_bytes
+                );
             }
-        });
-        info!("Outputting to stdout (playback stream disabled).");
-        _playback_stream_handle = None;
-        _playback_listener_handle = None;
-    } else {
-        // Create Playback Stream (Output to HDMI/Sink)
 
-        // Strategy: Use properties for Audio/Source
-        let mut playback_props = build_playback_properties(&playback_target);
-        playback_props.insert("node.latency", node_latency);
-        if let Some(frames) = requested_latency_frames {
-            let force_quantum = frames.to_string();
-            playback_props.insert("node.force-quantum", force_quantum.as_str());
-            playback_props.insert("node.lock-quantum", "true");
-            playback_props.insert("node.force-rate", SAMPLE_RATE);
-            playback_props.insert("node.lock-rate", "true");
-            info!(
-                "Playback stream requesting forced quantum/rate: {} frames @ {} Hz",
-                frames, SAMPLE_RATE_HZ
-            );
-        }
+            let output_data = Arc::new(Mutex::new(output_consumer));
+            let playback_primed = Arc::new(AtomicBool::new(false));
+            let playback_prefill_logged = Arc::new(AtomicBool::new(false));
+            let playback_callback_quantum_logged = Arc::new(AtomicBool::new(false));
 
-        let output_ring_capacity_bytes = output_consumer.buffer().capacity();
-        let playback_target_quantum_bytes = requested_latency_frames
-            .map(|frames| frames.saturating_mul(OUTPUT_FRAME_BYTES))
-            .filter(|bytes| *bytes > 0)
-            .unwrap_or(0);
+            // Create stream
+            let playback_stream =
+                pw::stream::Stream::new(&core, "ac3-encoder-playback", playback_props)?;
 
-        if playback_target_quantum_bytes > 0 {
-            info!(
-                "Playback target quantum: {} frames / {} bytes (ring capacity: {} bytes)",
-                requested_latency_frames.unwrap_or(0),
-                playback_target_quantum_bytes,
-                output_ring_capacity_bytes
-            );
-        }
-
-        let output_data = Arc::new(Mutex::new(output_consumer));
-        let playback_primed = Arc::new(AtomicBool::new(false));
-        let playback_prefill_logged = Arc::new(AtomicBool::new(false));
-        let playback_callback_quantum_logged = Arc::new(AtomicBool::new(false));
-
-        // Create stream
-        let playback_stream =
-            pw::stream::Stream::new(&core, "ac3-encoder-playback", playback_props)?;
-
-        let playback_listener = playback_stream
+            let playback_listener = playback_stream
             .add_local_listener::<()>()
             .state_changed(|_stream, _data, old, new| {
                 info!("Playback Stream state changed: {:?} -> {:?}", old, new);
@@ -724,22 +1023,23 @@ pub fn run_pipewire_loop_with_config(
             )
             .register()?;
 
-        let playback_format_bytes =
-            build_audio_raw_format_param(AudioFormat::S16LE, OUTPUT_CHANNELS as u32)?;
-        let playback_format_pod = pw::spa::pod::Pod::from_bytes(&playback_format_bytes)
-            .ok_or_else(|| anyhow!("Failed to parse playback format pod bytes"))?;
-        let mut playback_params = [playback_format_pod];
-        // Connect Playback Stream
-        playback_stream.connect(
-            Direction::Output,
-            playback_target.connect_target_id,
-            StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS | StreamFlags::AUTOCONNECT,
-            &mut playback_params,
-        )?;
+            let playback_format_bytes =
+                build_audio_raw_format_param(AudioFormat::S16LE, OUTPUT_CHANNELS as u32)?;
+            let playback_format_pod = pw::spa::pod::Pod::from_bytes(&playback_format_bytes)
+                .ok_or_else(|| anyhow!("Failed to parse playback format pod bytes"))?;
+            let mut playback_params = [playback_format_pod];
+            // Connect Playback Stream
+            playback_stream.connect(
+                Direction::Output,
+                playback_target.connect_target_id,
+                StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS | StreamFlags::AUTOCONNECT,
+                &mut playback_params,
+            )?;
 
-        info!("PipeWire playback stream connected (Server Node).");
-        _playback_stream_handle = Some(playback_stream);
-        _playback_listener_handle = Some(playback_listener);
+            info!("PipeWire playback stream connected (Server Node).");
+            _playback_stream_handle = Some(playback_stream);
+            _playback_listener_handle = Some(playback_listener);
+        }
     }
 
     info!("PipeWire loop running. Press Ctrl+C to stop.");
