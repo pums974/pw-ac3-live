@@ -29,6 +29,7 @@ DAEMON_PID=""
 RECORD_PID=""
 PLAY_PID=""
 PW_RECORD_EXTRA_ARGS=()
+PW_LINK_CONNECT_ARGS=()
 
 stop_recorder() {
   if [ -z "$RECORD_PID" ]; then
@@ -73,6 +74,10 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+pw_link_connect() {
+  pw-link "${PW_LINK_CONNECT_ARGS[@]}" "$1" "$2"
+}
 
 wait_for_pw_port() {
   local description="$1"
@@ -119,7 +124,7 @@ connect_output_to_sink() {
     local src="${output_ports[$src_idx]}"
     local dst="${sink_ports[$idx]}"
     log "Linking $src -> $dst"
-    pw-link --wait "$src" "$dst" || log "Link failed for $src -> $dst (already linked?)"
+    pw_link_connect "$src" "$dst" || log "Link failed for $src -> $dst (already linked?)"
   done
 }
 
@@ -141,7 +146,7 @@ connect_feeder_to_input() {
     local dst="${input_ports[0]}"
     for src in "${feeder_ports[@]}"; do
       log "Linking $src -> $dst"
-      pw-link --wait "$src" "$dst" || log "Link failed for $src -> $dst (already linked?)"
+      pw_link_connect "$src" "$dst" || log "Link failed for $src -> $dst (already linked?)"
     done
     return 0
   fi
@@ -156,7 +161,7 @@ connect_feeder_to_input() {
     local src="${feeder_ports[$i]}"
     local dst="${input_ports[$i]}"
     log "Linking $src -> $dst"
-    pw-link --wait "$src" "$dst" || log "Link failed for $src -> $dst (already linked?)"
+    pw_link_connect "$src" "$dst" || log "Link failed for $src -> $dst (already linked?)"
   done
 }
 
@@ -186,6 +191,11 @@ if pw-record --help 2>&1 | grep -q -- "--raw"; then
   PW_RECORD_EXTRA_ARGS+=(--raw)
 else
   log "pw-record --raw is not supported on this host; using default output mode"
+fi
+if pw-link --help 2>&1 | grep -q -- "--wait"; then
+  PW_LINK_CONNECT_ARGS+=(--wait)
+else
+  log "pw-link --wait is not supported on this host; using immediate link mode"
 fi
 
 # Ensure we don't validate stale artifacts from previous runs.

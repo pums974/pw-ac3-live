@@ -33,6 +33,7 @@ PIPELINE_PID=""
 RECORD_PID=""
 PLAY_PID=""
 PW_RECORD_EXTRA_ARGS=()
+PW_LINK_CONNECT_ARGS=()
 
 stop_recorder() {
   if [ -z "$RECORD_PID" ]; then
@@ -84,6 +85,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+pw_link_connect() {
+  pw-link "${PW_LINK_CONNECT_ARGS[@]}" "$1" "$2"
+}
+
 # 1. Check Dependencies
 log "Checking dependencies..."
 command -v cargo > /dev/null 2>&1 || {
@@ -110,6 +115,11 @@ if pw-record --help 2>&1 | grep -q -- "--raw"; then
   PW_RECORD_EXTRA_ARGS+=(--raw)
 else
   log "pw-record --raw is not supported on this host; using default output mode"
+fi
+if pw-link --help 2>&1 | grep -q -- "--wait"; then
+  PW_LINK_CONNECT_ARGS+=(--wait)
+else
+  log "pw-link --wait is not supported on this host; using immediate link mode"
 fi
 
 # Ensure we don't validate stale artifacts from previous runs.
@@ -265,7 +275,7 @@ link_ports_by_id() {
     local dst="${SINK_IDS[0]}"
     for src in "${FEEDER_IDS[@]}"; do
       log "Linking ID $src -> $dst"
-      pw-link --wait "$src" "$dst" || log "Link failed (already linked/incompatible): $src -> $dst"
+      pw_link_connect "$src" "$dst" || log "Link failed (already linked/incompatible): $src -> $dst"
     done
     return
   fi
@@ -275,7 +285,7 @@ link_ports_by_id() {
     local src="${FEEDER_IDS[$i]}"
     local dst="${SINK_IDS[$i]}"
     log "Linking ID $src -> $dst"
-    pw-link --wait "$src" "$dst" || log "Link failed (already linked/incompatible): $src -> $dst"
+    pw_link_connect "$src" "$dst" || log "Link failed (already linked/incompatible): $src -> $dst"
   done
 }
 
